@@ -92,7 +92,7 @@ def reduce_image_palette(image, color_count):
     return torch.cat((reduced_rgb, image[..., 3:]), dim=-1)
 
 
-def collapse_pixel_grid_mode(image, logical_width, logical_height):
+def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True):
     batch_size, height, width, channels = image.shape
     block_height = height // logical_height
     block_width = width // logical_width
@@ -131,6 +131,8 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height):
     first_positions = torch.where(eligible, positions, block_pixels).min(dim=1).values
     selected = cells[torch.arange(cells.shape[0], device=image.device), first_positions]
     logical = selected.reshape(batch_size, logical_height, logical_width, channels)
+    if not scale_to_original:
+        return logical
     return logical.repeat_interleave(block_height, dim=1).repeat_interleave(block_width, dim=2)
 
 
@@ -152,12 +154,14 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                              tooltip="Maximum number of colors in each image's palette."),
                 io.Boolean.Input("color_reduction_first", default=True,
                                  tooltip="Reduce the palette before grid collapse. Disable for collapse-then-reduce behavior."),
+                io.Boolean.Input("scale_to_original", default=True,
+                                 tooltip="Expand the logical pixel grid back to the input dimensions."),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
-    def execute(cls, image, width, height, colors, color_reduction_first):
+    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
@@ -168,7 +172,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
 
         if color_reduction_first:
             reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image])
-            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height))
+            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original))
 
-        collapsed = collapse_pixel_grid_mode(image, width, height)
+        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original)
         return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed]))

@@ -11,7 +11,7 @@ The node performs two operations. By default, it runs them in this order:
 
 Disable `color_reduction_first` to reverse the order and collapse the grid before palette reduction.
 
-The result retains the input dimensions, supports image batches and alpha channels, and uses only PyTorch supplied by ComfyUI.
+By default the result is expanded back to the input dimensions with nearest-neighbor scaling. Disable `scale_to_original` to return the logical grid at exactly `width × height`. The node supports image batches and alpha channels and uses only PyTorch supplied by ComfyUI.
 
 ## Installation
 
@@ -33,6 +33,7 @@ Find **Krea 2 Pixel Art Refiner** under `image/krea2`.
 | `height` | 64 | Logical pixel-grid height. |
 | `colors` | 24 | Maximum colors selected separately for each image. |
 | `color_reduction_first` | On | Reduce colors before collapsing the pixel grid. |
+| `scale_to_original` | On | Expand the logical grid back to the input dimensions. |
 
 The input width and height must be evenly divisible by the requested logical width and height.
 
