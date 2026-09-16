@@ -140,7 +140,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
         return io.Schema(
             node_id="Krea2PixelArtRefiner",
             display_name="Krea 2 Pixel Art Refiner",
-            description="Collapses an image to a modal pixel grid, then reduces it to a perceptually selected palette.",
+            description="Combines perceptual palette reduction with a modal pixel-grid collapse in a selectable order.",
             category="image/krea2",
             inputs=[
                 io.Image.Input("image"),
@@ -150,12 +150,14 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                              tooltip="Number of logical pixels down the refined image."),
                 io.Int.Input("colors", default=24, min=2, max=256, step=1,
                              tooltip="Maximum number of colors in each image's palette."),
+                io.Boolean.Input("color_reduction_first", default=True,
+                                 tooltip="Reduce the palette before grid collapse. Disable for collapse-then-reduce behavior."),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
-    def execute(cls, image, width, height, colors):
+    def execute(cls, image, width, height, colors, color_reduction_first):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
@@ -164,6 +166,9 @@ class Krea2PixelArtRefiner(io.ComfyNode):
         if image_width % width != 0 or image_height % height != 0:
             raise ValueError(f"Image size {image_width}x{image_height} must be divisible by logical grid {width}x{height}")
 
+        if color_reduction_first:
+            reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image])
+            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height))
+
         collapsed = collapse_pixel_grid_mode(image, width, height)
-        reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed])
-        return io.NodeOutput(reduced)
+        return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed]))
