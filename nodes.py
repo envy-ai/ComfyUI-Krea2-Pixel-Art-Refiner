@@ -118,10 +118,33 @@ def shared_perceptual_palette(images, color_count):
     return perceptual_palette(srgb_to_oklab(unique_rgb), counts, color_count)
 
 
-def palette_from_image(palette_image, additional_color, dtype, device):
+def palette_from_image(palette_image, additional_color, color_count, dtype, device):
     palette_pixels = palette_image[..., :3].to(device=device, dtype=dtype).reshape(-1, 3)
-    palette_pixels = torch.cat((palette_pixels, additional_color.to(device=device, dtype=dtype).reshape(1, 3)))
     rgb8 = (palette_pixels.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
+    unique_codes, counts = torch.unique(color_codes, return_counts=True)
+    palette_rgb = torch.stack((
+        (unique_codes >> 16) & 255,
+        (unique_codes >> 8) & 255,
+        unique_codes & 255,
+    ), dim=1).to(dtype=dtype) / 255.0
+    if unique_codes.shape[0] > color_count:
+        training_rgb = palette_rgb
+        training_counts = counts
+        if unique_codes.shape[0] > PALETTE_TRAINING_COLORS:
+            positions = torch.linspace(0, color_codes.shape[0] - 1, PALETTE_TRAINING_COLORS,
+                                       dtype=torch.float64, device=device).round().long()
+            training_codes, training_counts = torch.unique(color_codes[positions], return_counts=True)
+            training_rgb = torch.stack((
+                (training_codes >> 16) & 255,
+                (training_codes >> 8) & 255,
+                training_codes & 255,
+            ), dim=1).to(dtype=dtype) / 255.0
+        palette_oklab = perceptual_palette(srgb_to_oklab(training_rgb), training_counts, color_count)
+        palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
+
+    palette_rgb = torch.cat((palette_rgb, additional_color.to(device=device, dtype=dtype).reshape(1, 3)))
+    rgb8 = (palette_rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
     unique_codes = torch.unique(color_codes)
     palette_rgb = torch.stack((
@@ -213,15 +236,44 @@ def detect_pixel_grid_offsets(image, logical_width, logical_height):
     return column_offsets, row_offsets
 
 
-def roll_image_batch(image, column_offsets, row_offsets, direction):
-    if not any(column_offsets) and not any(row_offsets):
-        return image
-    if len(set(column_offsets)) == 1 and len(set(row_offsets)) == 1:
-        return torch.roll(image, shifts=(direction * row_offsets[0], direction * column_offsets[0]), dims=(1, 2))
-    return torch.stack([
-        torch.roll(batch_image, shifts=(direction * row_offset, direction * column_offset), dims=(0, 1))
-        for batch_image, column_offset, row_offset in zip(image, column_offsets, row_offsets)
-    ])
+def collapse_single_image_grid(image, logical_width, logical_height, scale_to_original, allow_uneven_grid,
+                               column_offset, row_offset):
+    height, width, channels = image.shape
+    if column_offset or row_offset:
+        image = torch.roll(image, shifts=(-row_offset, -column_offset), dims=(0, 1))
+    if allow_uneven_grid and (height % logical_height != 0 or width % logical_width != 0):
+        row_bounds = torch.arange(logical_height + 1, device=image.device) * height // logical_height
+        column_bounds = torch.arange(logical_width + 1, device=image.device) * width // logical_width
+        row_ids = torch.repeat_interleave(torch.arange(logical_height, device=image.device), row_bounds[1:] - row_bounds[:-1])
+        column_ids = torch.repeat_interleave(torch.arange(logical_width, device=image.device), column_bounds[1:] - column_bounds[:-1])
+        cell_count = logical_height * logical_width
+        cell_ids = (row_ids[:, None] * logical_width + column_ids[None, :]).reshape(-1)
+        center_rows = row_bounds[:-1] + (row_bounds[1:] - row_bounds[:-1]) // 2
+        center_columns = column_bounds[:-1] + (column_bounds[1:] - column_bounds[:-1]) // 2
+        center_pixels = image[center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
+        selected = select_modal_pixels(image.reshape(-1, channels), cell_ids, cell_count, center_pixels)
+        logical = selected.reshape(logical_height, logical_width, channels)
+        if scale_to_original:
+            output = logical.index_select(0, row_ids).index_select(1, column_ids)
+    else:
+        block_height = height // logical_height
+        block_width = width // logical_width
+        block_pixels = block_height * block_width
+        cells = image.reshape(logical_height, block_height, logical_width, block_width, channels)
+        cells = cells.permute(0, 2, 1, 3, 4).reshape(-1, block_pixels, channels)
+        cell_count = cells.shape[0]
+        cell_ids = torch.arange(cell_count, device=image.device)[:, None].expand(cell_count, block_pixels).reshape(-1)
+        center_index = (block_height // 2) * block_width + block_width // 2
+        selected = select_modal_pixels(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
+        logical = selected.reshape(logical_height, logical_width, channels)
+        if scale_to_original:
+            output = logical.repeat_interleave(block_height, dim=0).repeat_interleave(block_width, dim=1)
+
+    if not scale_to_original:
+        return logical
+    if column_offset or row_offset:
+        output = torch.roll(output, shifts=(row_offset, column_offset), dims=(0, 1))
+    return output
 
 
 def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True, allow_uneven_grid=False,
@@ -233,41 +285,14 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
     else:
         column_offsets = detected_offsets[0].tolist()
         row_offsets = detected_offsets[1].tolist()
-    image = roll_image_batch(image, column_offsets, row_offsets, -1)
 
-    if allow_uneven_grid and (height % logical_height != 0 or width % logical_width != 0):
-        row_bounds = torch.arange(logical_height + 1, device=image.device) * height // logical_height
-        column_bounds = torch.arange(logical_width + 1, device=image.device) * width // logical_width
-        row_ids = torch.repeat_interleave(torch.arange(logical_height, device=image.device), row_bounds[1:] - row_bounds[:-1])
-        column_ids = torch.repeat_interleave(torch.arange(logical_width, device=image.device), column_bounds[1:] - column_bounds[:-1])
-        cells_per_image = logical_height * logical_width
-        image_cells = row_ids[:, None] * logical_width + column_ids[None, :]
-        batch_cells = torch.arange(batch_size, device=image.device)[:, None, None] * cells_per_image
-        cell_ids = (batch_cells + image_cells).reshape(-1)
-        center_rows = row_bounds[:-1] + (row_bounds[1:] - row_bounds[:-1]) // 2
-        center_columns = column_bounds[:-1] + (column_bounds[1:] - column_bounds[:-1]) // 2
-        center_pixels = image[:, center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
-        selected = select_modal_pixels(image.reshape(-1, channels), cell_ids, batch_size * cells_per_image, center_pixels)
-        logical = selected.reshape(batch_size, logical_height, logical_width, channels)
-        if scale_to_original:
-            output = logical.index_select(1, row_ids).index_select(2, column_ids)
-    else:
-        block_height = height // logical_height
-        block_width = width // logical_width
-        block_pixels = block_height * block_width
-        cells = image.reshape(batch_size, logical_height, block_height, logical_width, block_width, channels)
-        cells = cells.permute(0, 1, 3, 2, 4, 5).reshape(-1, block_pixels, channels)
-        cell_count = cells.shape[0]
-        cell_ids = torch.arange(cell_count, device=image.device)[:, None].expand(cell_count, block_pixels).reshape(-1)
-        center_index = (block_height // 2) * block_width + block_width // 2
-        selected = select_modal_pixels(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
-        logical = selected.reshape(batch_size, logical_height, logical_width, channels)
-        if scale_to_original:
-            output = logical.repeat_interleave(block_height, dim=1).repeat_interleave(block_width, dim=2)
-
-    if not scale_to_original:
-        return logical
-    return roll_image_batch(output, column_offsets, row_offsets, 1)
+    output_height = height if scale_to_original else logical_height
+    output_width = width if scale_to_original else logical_width
+    output = torch.empty((batch_size, output_height, output_width, channels), dtype=image.dtype, device=image.device)
+    for index, batch_image in enumerate(image):
+        output[index] = collapse_single_image_grid(batch_image, logical_width, logical_height, scale_to_original,
+                                                   allow_uneven_grid, column_offsets[index], row_offsets[index])
+    return output
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
@@ -301,7 +326,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                 io.Boolean.Input("auto_offset", default=False,
                                  tooltip="Detect the X and Y grid phase separately for each image. Overrides x_offset and y_offset."),
                 io.Image.Input("palette_image", optional=True,
-                               tooltip="Use the unique colors in this image as the palette for the entire batch. Overrides colors and shared_palette."),
+                               tooltip="Use this image's colors as the palette for the entire batch. Palettes above colors are reduced first. Overrides shared_palette."),
             ],
             outputs=[io.Image.Output()],
         )
@@ -321,7 +346,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
 
         fixed_palette = None
         if palette_image is not None:
-            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], image.dtype, image.device)
+            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
         detected_offsets = detect_pixel_grid_offsets(image, width, height) if auto_offset else None
 
         if color_reduction_first:

@@ -19,7 +19,7 @@ Use `x_offset` and `y_offset` to shift the grid phase by a fraction of one logic
 
 Enable `auto_offset` to detect the strongest repeating X and Y edge phases separately for every image in a batch. Flat margins contribute negligible periodic evidence. Automatic detection overrides the manual offsets and falls back to zero on an image axis with no detectable repeating edges.
 
-Enable `shared_palette` to generate one palette from the entire input batch and apply it to every image. Connect `palette_image` to use its unique RGB colors as the palette instead; this overrides `colors` and `shared_palette`. The upper-left RGB color of the first input image is always added to an image-supplied palette so a differing background remains available.
+Enable `shared_palette` to generate one palette from the entire input batch and apply it to every image. Connect `palette_image` to use its RGB colors as the palette instead; this overrides `shared_palette`. If the palette image contains more unique colors than `colors`, it is perceptually reduced to that limit first. The upper-left RGB color of the first input image is then added so a differing background remains available.
 
 ## Installation
 
@@ -47,7 +47,7 @@ Find **Krea 2 Pixel Art Refiner** under `image/krea2`.
 | `x_offset` | 0.0 | Shift the grid right by a fraction of one logical pixel. |
 | `y_offset` | 0.0 | Shift the grid down by a fraction of one logical pixel. |
 | `auto_offset` | Off | Detect X/Y grid phase for every image and override the manual offsets. |
-| `palette_image` | — | Optional image whose unique RGB colors become the shared palette, plus the first input image's upper-left color. |
+| `palette_image` | — | Optional image whose RGB colors become the shared palette, reduced to `colors` when needed, plus the first input image's upper-left color. |
 
 When `allow_uneven_grid` is disabled, the input width and height must be evenly divisible by the requested logical width and height.
 
