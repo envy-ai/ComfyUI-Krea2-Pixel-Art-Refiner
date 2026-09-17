@@ -1,5 +1,9 @@
+from math import ceil
+
+import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 from comfy_api.latest import io
 
@@ -296,193 +300,104 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
     return output
 
 
-def visible_components(mask, minimum_area=25):
-    mask = mask.detach().to(device="cpu").numpy()
-    parents = []
-    runs = []
-    previous = []
+def frame_edge_map(frame, scale):
+    rgb = (frame[..., :3].detach().to(device="cpu").clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
+    if frame.shape[-1] > 3:
+        alpha = frame[..., 3].detach().to(device="cpu").numpy()
+        rgb[alpha < 0.5] = 255
+    if scale > 1:
+        rgb = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
+    if rgb.shape[0] <= 4 or rgb.shape[1] <= 4:
+        raise ValueError("MiniMax H3 pixel art autorefiner requires images larger than 4x4 pixels")
+    grey = np.asarray(Image.fromarray(rgb[2:-2, 2:-2]).convert("L"))
+    edges = cv2.Canny(grey, 50, 200)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (8, 8))
+    return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-    def find(label):
-        while parents[label] != label:
-            parents[label] = parents[parents[label]]
-            label = parents[label]
-        return label
 
-    def union(first, second):
-        first = find(first)
-        second = find(second)
-        if first != second:
-            parents[max(first, second)] = min(first, second)
+def cluster_mesh_lines(lines, threshold=4):
+    lines = sorted(lines)
+    clusters = [[lines[0]]]
+    for position in lines[1:]:
+        if position - clusters[-1][-1] <= threshold:
+            clusters[-1].append(position)
+        else:
+            clusters.append([position])
+    return [int(np.median(cluster)) for cluster in clusters]
 
-    for row_index, row in enumerate(mask):
-        padded = np.pad(row, (1, 1))
-        changes = np.diff(padded.astype(np.int8))
-        starts = np.flatnonzero(changes == 1)
-        ends = np.flatnonzero(changes == -1)
-        current = []
-        previous_index = 0
-        for start, end in zip(starts.tolist(), ends.tolist()):
-            label = len(parents)
-            parents.append(label)
-            while previous_index < len(previous) and previous[previous_index][1] < start:
-                previous_index += 1
-            overlap_index = previous_index
-            while overlap_index < len(previous) and previous[overlap_index][0] <= end:
-                union(label, previous[overlap_index][2])
-                overlap_index += 1
-            current.append((start, end, label))
-            runs.append((row_index, start, end, label))
-        previous = current
 
-    components = {}
-    for row, start, end, label in runs:
-        root = find(label)
-        component = components.setdefault(root, {
-            "area": 0,
-            "top": row,
-            "bottom": row + 1,
-            "left": start,
-            "right": end,
-            "runs": [],
-        })
-        component["area"] += end - start
-        component["top"] = min(component["top"], row)
-        component["bottom"] = max(component["bottom"], row + 1)
-        component["left"] = min(component["left"], start)
-        component["right"] = max(component["right"], end)
-        component["runs"].append((row, start, end))
-
-    return sorted(
-        (component for component in components.values() if component["area"] > minimum_area),
-        key=lambda component: (component["left"], component["top"]),
+def detect_mesh_lines(edges):
+    detected = cv2.HoughLinesP(
+        edges, 1.0, np.deg2rad(1.0), 100, minLineLength=50, maxLineGap=10
     )
+    height, width = edges.shape
+    lines_x = [0, width - 1]
+    lines_y = [0, height - 1]
+    if detected is not None:
+        for x1, y1, x2, y2 in detected.reshape(-1, 4):
+            angle = abs(np.arctan2(y2 - y1, x2 - x1))
+            if angle > np.deg2rad(75):
+                lines_x.append(round((x1 + x2) / 2))
+            elif angle < np.deg2rad(15):
+                lines_y.append(round((y1 + y2) / 2))
+    return cluster_mesh_lines(lines_x), cluster_mesh_lines(lines_y)
 
 
-def component_mask(component, device):
-    height = component["bottom"] - component["top"]
-    width = component["right"] - component["left"]
-    mask = np.zeros((height, width), dtype=np.bool_)
-    for row, start, end in component["runs"]:
-        mask[row - component["top"], start - component["left"]:end - component["left"]] = True
-    return torch.from_numpy(mask).to(device=device)
+def estimate_mesh_pixel_width(mesh):
+    gaps = np.concatenate([np.diff(lines) for lines in mesh])
+    low = np.percentile(gaps, 20)
+    high = np.percentile(gaps, 80)
+    middle = gaps[(gaps >= low) & (gaps <= high)]
+    return max(1, int(np.round(np.median(middle if len(middle) else gaps))))
 
 
-def blob_color_codes(blob):
-    rgb8 = (blob[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
-    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
-    return torch.where(blob[..., 3] > 0, color_codes, -1)
+def homogenize_mesh_lines(lines, pixel_width):
+    completed = []
+    for start, end in zip(lines, lines[1:]):
+        cell_count = int(np.round((end - start) / pixel_width))
+        if cell_count > 0:
+            cell_width = (end - start) / cell_count
+            completed.extend(start + int(index * cell_width) for index in range(cell_count))
+    completed.append(lines[-1])
+    return completed
 
 
-def estimate_pixel_period(color_code_images, maximum_logical_size, minimum_allowed=1, maximum_allowed=None):
-    color_code_images = [codes.detach().to(device="cpu").numpy() for codes in color_code_images]
-    minimum_period = max(minimum_allowed, max(
-        (codes.shape[1] + maximum_logical_size - 1) // maximum_logical_size for codes in color_code_images
-    ))
-    maximum_period = max(codes.shape[1] for codes in color_code_images)
-    if maximum_allowed is not None:
-        maximum_period = min(maximum_period, maximum_allowed)
-    maximum_period = max(minimum_period, maximum_period)
-    run_lengths = []
-    for color_codes in color_code_images:
-        size = color_codes.shape[1]
-        for row in color_codes:
-            starts = np.concatenate(([0], np.flatnonzero(row[1:] != row[:-1]) + 1))
-            ends = np.concatenate((starts[1:], [size]))
-            run_lengths.extend((ends - starts)[row[starts] >= 0].tolist())
-    if not run_lengths:
-        return minimum_period
-
-    counts = np.bincount(run_lengths, minlength=maximum_period + 2)
-    weighted_counts = counts * np.arange(counts.shape[0])
-    period = minimum_period
-    for candidate in range(max(2, minimum_period), maximum_period + 1):
-        previous = weighted_counts[candidate - 1] if candidate > minimum_period else 0
-        following = weighted_counts[candidate + 1] if candidate < maximum_period else 0
-        if counts[candidate] > 1 and weighted_counts[candidate] > previous and weighted_counts[candidate] >= following:
-            period = candidate
-            break
-    return period
+def mesh_from_edges(edges):
+    initial = detect_mesh_lines(edges)
+    pixel_width = estimate_mesh_pixel_width(initial)
+    return tuple(homogenize_mesh_lines(lines, pixel_width) for lines in initial)
 
 
-def pixel_grid_phase(color_codes, period, maximum_logical_size):
-    color_codes = color_codes.detach().to(device="cpu").numpy()
-    size = color_codes.shape[1]
-    edges = (color_codes[:, 1:] != color_codes[:, :-1]).sum(axis=0)
-    positions = np.flatnonzero(edges > 0) + 1
-    if positions.shape[0] == 0:
-        return 0
-    residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
-    for phase in np.argsort(-residue_energy, kind="stable").tolist():
-        leading_padding = (period - phase) % period
-        logical_size = (leading_padding + size + period - 1) // period
-        if logical_size <= maximum_logical_size:
-            return phase
-    return 0
+def usable_mesh(mesh):
+    lines_x, lines_y = mesh
+    return len(lines_x) >= 2 and len(lines_y) >= 2 and not (len(lines_x) in (2, 3) and len(lines_y) in (2, 3))
 
 
-def detect_vertical_period(blobs, maximum_width, maximum_height):
-    color_codes = [blob_color_codes(blob["image"]) for blob in blobs]
-    period_y = estimate_pixel_period([codes.transpose(0, 1) for codes in color_codes], maximum_height)
-    minimum_period_x = max(codes.shape[1] / maximum_width for codes in color_codes)
-    return max(period_y, int(np.ceil(minimum_period_x / 1.1)))
+def aggregate_edge_maps(images, scale):
+    votes = None
+    for frame in images:
+        edges = frame_edge_map(frame, scale)
+        if votes is None:
+            votes = np.zeros(edges.shape, dtype=np.int32)
+        votes += edges > 0
+    minimum_votes = max(1, ceil(0.25 * images.shape[0]))
+    return ((votes >= minimum_votes) * 255).astype(np.uint8)
 
 
-def grid_axis(size, period, phase):
-    phase %= period
-    start = 0.0 if phase < 1e-6 else phase - period
-    leading_padding = int(round(-start))
-    required_size = leading_padding + size
-    boundaries = [0]
-    index = 1
-    while boundaries[-1] < required_size:
-        boundary = int(round(index * period))
-        boundaries.append(max(boundary, boundaries[-1] + 1))
-        index += 1
-    return leading_padding, boundaries
+def regular_mesh(image_width, image_height, logical_width, logical_height):
+    lines_x = [round(index * image_width / logical_width) for index in range(logical_width + 1)]
+    lines_y = [round(index * image_height / logical_height) for index in range(logical_height + 1)]
+    return lines_x, lines_y
 
 
-def horizontal_edge_energy(image):
-    rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
-    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
-    if image.shape[-1] > 3:
-        color_codes = torch.where(image[..., 3] > 0, color_codes, -1)
-    return (color_codes[:, 1:] != color_codes[:, :-1]).sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
-
-
-def horizontal_grid(image_slice, slice_left, blob, period_y, maximum_width):
-    edge_energy = horizontal_edge_energy(image_slice)
-    if edge_energy.size == 0:
-        return float(period_y), 0.0
-    positions = np.arange(edge_energy.shape[0], dtype=np.float64)
-    minimum_period = max(0.9 * period_y, blob["image"].shape[1] / maximum_width)
-    maximum_period = 1.1 * period_y
-    candidate_count = max(2, int(np.ceil((maximum_period - minimum_period) * 100)) + 1)
-    candidates = np.linspace(minimum_period, maximum_period, candidate_count)
-    scored_periods = []
-    for period in candidates:
-        valid = positions + period <= positions[-1]
-        first = edge_energy[valid]
-        second = np.interp(positions[valid] + period, positions, edge_energy)
-        denominator = np.sqrt(np.dot(first, first) * np.dot(second, second))
-        score = np.dot(first, second) / denominator if denominator > 0 else 0.0
-        scored_periods.append((score, period))
-
-    edge_positions = np.flatnonzero(edge_energy > 0).astype(np.float64) + 1.0
-    edge_weights = edge_energy[edge_positions.astype(np.int64) - 1]
-    blob_offset = blob["left"] - slice_left
-    for _, period in sorted(scored_periods, reverse=True):
-        phase_count = max(1, int(np.ceil(period * 20)))
-        phases = np.linspace(0.0, period, phase_count, endpoint=False)
-        phase_scores = []
-        for phase in phases:
-            distance = np.abs((edge_positions - phase + period * 0.5) % period - period * 0.5)
-            phase_scores.append(np.dot(edge_weights, np.exp(-0.5 * np.square(distance) / 0.75 ** 2)))
-        for phase_index in np.argsort(-np.asarray(phase_scores), kind="stable"):
-            phase = phases[phase_index]
-            blob_phase = (phase - blob_offset) % period
-            if len(grid_axis(blob["image"].shape[1], period, blob_phase)[1]) - 1 <= maximum_width:
-                return float(period), float(blob_phase)
-    return float(maximum_period), 0.0
+def detect_pixel_mesh(images, fallback_width, fallback_height):
+    mesh = mesh_from_edges(aggregate_edge_maps(images, 2))
+    if usable_mesh(mesh):
+        return mesh, 2
+    mesh = mesh_from_edges(aggregate_edge_maps(images, 1))
+    if usable_mesh(mesh):
+        return mesh, 1
+    return regular_mesh(images.shape[2], images.shape[1], fallback_width, fallback_height), 1
 
 
 def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
@@ -519,99 +434,42 @@ def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
     return pixels[first_positions]
 
 
-def collapse_blob(blob, period_x, phase_x, period_y, phase_y):
-    height, width, channels = blob.shape
-    left, column_bounds = grid_axis(width, period_x, phase_x)
-    top, row_bounds = grid_axis(height, period_y, phase_y)
-    aligned = torch.zeros((row_bounds[-1], column_bounds[-1], channels), dtype=blob.dtype, device=blob.device)
-    aligned[top:top + height, left:left + width] = blob
+def collapse_frame_mesh(frame, mesh, scale):
+    rgb8 = (frame[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    background = rgb8[0, 0]
+    visible = torch.any(rgb8 != background, dim=-1)
+    if frame.shape[-1] > 3:
+        visible &= frame[..., 3] > 0
+    rgba = torch.zeros((*frame.shape[:2], 4), dtype=frame.dtype, device=frame.device)
+    rgba[..., :3] = frame[..., :3]
+    rgba[..., 3] = visible.to(dtype=frame.dtype)
+    if scale > 1:
+        rgba = rgba.repeat_interleave(scale, dim=0).repeat_interleave(scale, dim=1)
 
-    row_lengths = torch.tensor(np.diff(row_bounds), device=blob.device)
-    column_lengths = torch.tensor(np.diff(column_bounds), device=blob.device)
-    logical_height = row_lengths.shape[0]
-    logical_width = column_lengths.shape[0]
-    row_ids = torch.repeat_interleave(torch.arange(logical_height, device=blob.device), row_lengths)
-    column_ids = torch.repeat_interleave(torch.arange(logical_width, device=blob.device), column_lengths)
-    cell_count = logical_height * logical_width
+    lines_x, lines_y = mesh
+    row_lengths = torch.tensor(np.diff(lines_y), device=frame.device)
+    column_lengths = torch.tensor(np.diff(lines_x), device=frame.device)
+    logical_height = len(lines_y) - 1
+    logical_width = len(lines_x) - 1
+    row_ids = torch.repeat_interleave(torch.arange(logical_height, device=frame.device), row_lengths)
+    column_ids = torch.repeat_interleave(torch.arange(logical_width, device=frame.device), column_lengths)
+    pixels = rgba[:lines_y[-1], :lines_x[-1]]
     cell_ids = (row_ids[:, None] * logical_width + column_ids[None, :]).reshape(-1)
-    center_rows = torch.tensor(row_bounds[:-1], device=blob.device) + row_lengths // 2
-    center_columns = torch.tensor(column_bounds[:-1], device=blob.device) + column_lengths // 2
-    center_pixels = aligned[center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
-    selected = select_modal_rgba(aligned.reshape(-1, channels), cell_ids, cell_count, center_pixels)
-    logical = selected.reshape(logical_height, logical_width, channels)
-    visible = logical[..., 3] > 0
-    if not torch.any(visible):
-        return None
-    rows, columns = torch.where(visible)
-    return logical[rows.min():rows.max() + 1, columns.min():columns.max() + 1]
+    center_rows = torch.tensor(lines_y[:-1], device=frame.device) + row_lengths // 2
+    center_columns = torch.tensor(lines_x[:-1], device=frame.device) + column_lengths // 2
+    center_pixels = rgba[center_rows[:, None], center_columns[None, :]].reshape(-1, 4)
+    selected = select_modal_rgba(pixels.reshape(-1, 4), cell_ids, logical_height * logical_width, center_pixels)
+    return selected.reshape(logical_height, logical_width, 4)
 
 
-def pad_blob(blob, width, height):
-    blob_height, blob_width = blob.shape[:2]
-    if blob_width > width or blob_height > height:
-        raise ValueError(f"Collapsed blob size {blob_width}x{blob_height} exceeds target size {width}x{height}")
-    output = torch.zeros((height, width, 4), dtype=blob.dtype, device=blob.device)
-    top = (height - blob_height) // 2
-    left = (width - blob_width) // 2
-    output[top:top + blob_height, left:left + blob_width] = blob
-    return output
-
-
-def trim_frame_blobs(image):
-    rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
-    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
-    background = color_codes == color_codes[0, 0]
-    visible = ~background
-    if image.shape[-1] > 3:
-        visible &= image[..., 3] > 0
-
-    rgba = torch.zeros((*image.shape[:2], 4), dtype=image.dtype, device=image.device)
-    rgba[..., :3] = image[..., :3]
-    rgba[..., 3] = visible.to(dtype=image.dtype)
-    blobs = []
-    for component in visible_components(visible):
-        top, bottom = component["top"], component["bottom"]
-        left, right = component["left"], component["right"]
-        mask = component_mask(component, image.device)
-        blob = rgba[top:bottom, left:right].clone()
-        blob *= mask[..., None]
-        blobs.append({"image": blob, "left": left, "right": right})
-    return blobs
-
-
-def frame_horizontal_grids(image, blobs, period_y, maximum_width):
-    if not blobs:
-        return []
-    slice_bounds = [0]
-    for first, second in zip(blobs, blobs[1:]):
-        slice_bounds.append((first["right"] + second["left"]) // 2)
-    slice_bounds.append(image.shape[1])
-    return [
-        horizontal_grid(image[:, left:right], left, blob, period_y, maximum_width)
-        for blob, left, right in zip(blobs, slice_bounds, slice_bounds[1:])
-    ]
-
-
-def refine_frame_blobs(blobs, horizontal_grids, period_y, width, height):
-    output = []
-    for blob, (period_x, phase_x) in zip(blobs, horizontal_grids):
-        blob_image = blob["image"]
-        color_codes = blob_color_codes(blob_image)
-        phase_y = pixel_grid_phase(color_codes.transpose(0, 1), period_y, height)
-        collapsed = collapse_blob(blob_image, period_x, phase_x, period_y, phase_y)
-        if collapsed is not None:
-            output.append(pad_blob(collapsed, width, height))
-    return output
-
-
-def fit_strip_to_frame(strip, width, height):
-    scale = min(width / strip.shape[1], height / strip.shape[0])
-    scaled_width = max(1, min(width, round(strip.shape[1] * scale)))
-    scaled_height = max(1, min(height, round(strip.shape[0] * scale)))
+def fit_frame_to_size(frame, width, height):
+    scale = min(width / frame.shape[1], height / frame.shape[0])
+    scaled_width = max(1, min(width, round(frame.shape[1] * scale)))
+    scaled_height = max(1, min(height, round(frame.shape[0] * scale)))
     scaled = torch.nn.functional.interpolate(
-        strip.permute(2, 0, 1).unsqueeze(0), size=(scaled_height, scaled_width), mode="nearest-exact"
+        frame.permute(2, 0, 1).unsqueeze(0), size=(scaled_height, scaled_width), mode="nearest-exact"
     )[0].permute(1, 2, 0)
-    output = torch.zeros((height, width, 4), dtype=strip.dtype, device=strip.device)
+    output = torch.zeros((height, width, 4), dtype=frame.dtype, device=frame.device)
     top = (height - scaled_height) // 2
     left = (width - scaled_width) // 2
     output[top:top + scaled_height, left:left + scaled_width] = scaled
@@ -693,18 +551,18 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3PixelArtAutorefiner",
             display_name="MiniMax H3 Pixel Art Autorefiner",
-            description="Finds visible blobs, detects their pixel periods, collapses and packs them into sprite strips.",
+            description="Detects one pixel mesh across the full frame and collapses it without splitting sprites.",
             category="image/minimax",
             inputs=[
                 io.Image.Input("image"),
                 io.Int.Input("width", default=64, min=1, max=16384, step=1,
-                             tooltip="Width of the transparent canvas allocated to each collapsed blob."),
+                             tooltip="Fallback logical width used when automatic mesh detection cannot find a grid."),
                 io.Int.Input("height", default=64, min=1, max=16384, step=1,
-                             tooltip="Height of the transparent canvas allocated to each collapsed blob."),
+                             tooltip="Fallback logical height used when automatic mesh detection cannot find a grid."),
                 io.Int.Input("colors", default=24, min=2, max=256, step=1,
                              tooltip="Maximum generated or supplied palette size."),
                 io.Boolean.Input("scale_to_original", default=True,
-                                 tooltip="Scale each sprite strip to fit and pad it to the input frame dimensions."),
+                                 tooltip="Scale and pad the collapsed frame to the input dimensions."),
                 io.Boolean.Input("shared_palette", default=True,
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
                 io.Image.Input("palette_image", optional=True,
@@ -719,38 +577,20 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
             raise ValueError(f"MiniMax H3 pixel art autorefiner requires at least 3 image channels, got {image.shape[-1]}")
         if palette_image is not None and palette_image.shape[-1] < 3:
             raise ValueError(f"Palette image requires at least 3 image channels, got {palette_image.shape[-1]}")
+        if width > image.shape[2] or height > image.shape[1]:
+            raise ValueError(f"Fallback grid {width}x{height} cannot exceed image size {image.shape[2]}x{image.shape[1]}")
 
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
+        mesh, mesh_scale = detect_pixel_mesh(image, width, height)
         reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
-        trimmed_frame_blobs = [trim_frame_blobs(frame) for frame in reduced]
-        all_blobs = [blob for blobs in trimmed_frame_blobs for blob in blobs]
-        if all_blobs:
-            period_y = detect_vertical_period(all_blobs, width, height)
-            horizontal_grids = [frame_horizontal_grids(frame, blobs, period_y, width)
-                                for frame, blobs in zip(reduced, trimmed_frame_blobs)]
-            frame_blobs = [refine_frame_blobs(blobs, grids, period_y, width, height)
-                           for blobs, grids in zip(trimmed_frame_blobs, horizontal_grids)]
-        else:
-            frame_blobs = trimmed_frame_blobs
+        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
 
         if scale_to_original:
-            output = []
-            for blobs in frame_blobs:
-                if blobs:
-                    strip = torch.cat(blobs, dim=1)
-                else:
-                    strip = torch.zeros((height, width, 4), dtype=image.dtype, device=image.device)
-                output.append(fit_strip_to_frame(strip, image.shape[2], image.shape[1]))
+            output = [fit_frame_to_size(frame, image.shape[2], image.shape[1]) for frame in collapsed]
             return io.NodeOutput(composite_white(torch.stack(output)))
-
-        blob_count = max(1, max((len(blobs) for blobs in frame_blobs), default=0))
-        empty_blob = torch.zeros((height, width, 4), dtype=image.dtype, device=image.device)
-        output = []
-        for blobs in frame_blobs:
-            output.append(torch.cat(blobs + [empty_blob] * (blob_count - len(blobs)), dim=1))
-        return io.NodeOutput(composite_white(torch.stack(output)))
+        return io.NodeOutput(composite_white(torch.stack(collapsed)))
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):

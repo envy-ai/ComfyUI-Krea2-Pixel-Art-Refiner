@@ -55,27 +55,27 @@ When a palette image contains no more than `colors` unique RGB values, those exa
 
 ## MiniMax H3 Pixel Art Autorefiner
 
-Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It automatically extracts and processes separate sprites from each frame:
+Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It detects and collapses one pixel mesh across each complete frame:
 
 1. Reduce the frame to the requested perceptual palette.
-2. Treat the upper-left color as transparent and find eight-connected visible blobs larger than 25 source pixels.
-3. Detect one vertical period from all trimmed blobs in the input batch, then detect a fractional horizontal period from each sprite's full-height source slice. Each horizontal period stays within 10% of the vertical period, and both fit the requested logical resolution.
-4. Collapse each detected pixel cell with the same modal-color and center-pixel tie breaking used by the other refiners.
-5. Center each collapsed blob on a transparent `width × height` canvas and concatenate the canvases horizontally.
-6. Optionally scale and pad the strip to the original frame dimensions, then composite it on white.
+2. Upscale the source two times and detect edges with Canny and morphological closing.
+3. Find horizontal and vertical grid lines with a probabilistic Hough transform, cluster nearby lines, estimate the pixel size from the median filtered gaps, and complete the mesh.
+4. Collapse each mesh cell with the same modal-color and center-pixel tie breaking used by the other refiners.
+5. Treat the upper-left color as transparent, optionally scale and pad the complete collapsed frame to the original dimensions, then composite it on white.
+
+The mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJAllen/proper-pixel-art). Its palette quantizer is not used.
 
 | Input | Default | Description |
 | --- | ---: | --- |
 | `image` | — | ComfyUI image, video-frame batch, or image batch. |
-| `width` | 64 | Logical canvas width for each extracted blob. |
-| `height` | 64 | Logical canvas height for each extracted blob. |
+| `width` | 64 | Fallback logical width if automatic mesh detection fails. |
+| `height` | 64 | Fallback logical height if automatic mesh detection fails. |
 | `colors` | 24 | Maximum generated or reduced palette size. |
-| `scale_to_original` | On | Fit each strip inside the original frame and pad it to the original dimensions. |
+| `scale_to_original` | On | Fit the collapsed frame inside the original frame and pad it to the original dimensions. |
 | `shared_palette` | On | Generate one palette across the input batch. |
 | `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
 
-With `scale_to_original` disabled, frames with fewer blobs are padded with empty white slots so every image in the output batch has the same dimensions.
-Blobs are emitted in their original left-to-right order.
+For image batches, edge maps are combined before mesh detection so every frame uses the same grid. With `scale_to_original` disabled, the node returns the detected true pixel resolution.
 
 Typical wiring:
 
