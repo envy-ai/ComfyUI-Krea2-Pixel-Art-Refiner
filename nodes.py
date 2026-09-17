@@ -367,11 +367,12 @@ def component_mask(component, device):
     return torch.from_numpy(mask).to(device=device)
 
 
-def estimate_pixel_period(color_codes):
+def estimate_pixel_period(color_codes, maximum_logical_size):
     color_codes = color_codes.detach().to(device="cpu").numpy()
     size = color_codes.shape[1]
+    minimum_period = max(1, (size + maximum_logical_size - 1) // maximum_logical_size)
     if size < 4:
-        return 1, 0
+        return minimum_period, 0
 
     run_lengths = []
     for row in color_codes:
@@ -383,7 +384,7 @@ def estimate_pixel_period(color_codes):
 
     counts = np.bincount(run_lengths, minlength=size + 1)
     weighted_counts = counts * np.arange(counts.shape[0])
-    maximum_period = min(size // 2, counts.shape[0] - 1)
+    maximum_period = max(minimum_period, min(size // 2, counts.shape[0] - 1))
     period = 1
     for candidate in range(2, maximum_period + 1):
         previous = weighted_counts[candidate - 1]
@@ -391,13 +392,14 @@ def estimate_pixel_period(color_codes):
         if counts[candidate] > 1 and weighted_counts[candidate] > previous and weighted_counts[candidate] >= following:
             period = candidate
             break
-    if period == 1:
+    if period == 1 and minimum_period == 1:
         return 1, 0
+    period = max(period, minimum_period)
 
     edges = (color_codes[:, 1:] != color_codes[:, :-1]).sum(axis=0)
     best_period = period
     best_correlation = -1.0
-    for candidate in range(max(2, period - 1), min(maximum_period, period + 1) + 1):
+    for candidate in range(max(2, minimum_period, period - 1), min(maximum_period, period + 1) + 1):
         first = edges[:-candidate]
         second = edges[candidate:]
         denominator = np.sqrt(np.dot(first, first) * np.dot(second, second))
@@ -407,16 +409,23 @@ def estimate_pixel_period(color_codes):
             best_correlation = correlation
     period = best_period
     positions = np.flatnonzero(edges > 0) + 1
-    residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
-    return period, int(residue_energy.argmax())
+    while period <= size:
+        residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
+        phase = int(residue_energy.argmax())
+        leading_padding = (period - phase) % period
+        logical_size = (leading_padding + size + period - 1) // period
+        if logical_size <= maximum_logical_size:
+            return period, phase
+        period += 1
+    return size, 0
 
 
-def blob_periods(blob):
+def blob_periods(blob, maximum_width, maximum_height):
     rgb8 = (blob[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
     color_codes = torch.where(blob[..., 3] > 0, color_codes, -1)
-    period_x, phase_x = estimate_pixel_period(color_codes)
-    period_y, phase_y = estimate_pixel_period(color_codes.transpose(0, 1))
+    period_x, phase_x = estimate_pixel_period(color_codes, maximum_width)
+    period_y, phase_y = estimate_pixel_period(color_codes.transpose(0, 1), maximum_height)
     return period_x, phase_x, period_y, phase_y
 
 
@@ -510,7 +519,7 @@ def extract_frame_blobs(image, width, height):
         mask = component_mask(component, image.device)
         blob = rgba[top:bottom, left:right].clone()
         blob *= mask[..., None]
-        period_x, phase_x, period_y, phase_y = blob_periods(blob)
+        period_x, phase_x, period_y, phase_y = blob_periods(blob, width, height)
         collapsed = collapse_blob(blob, period_x, phase_x, period_y, phase_y)
         if collapsed is not None:
             blobs.append(pad_blob(collapsed, width, height))
