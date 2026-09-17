@@ -1,7 +1,7 @@
 [project]
 name = "krea2-pixel-art-refiner"
-version = "1.4.1"
-description = "Refine Krea 2 output with mode-based pixel-grid collapse and perceptual OKLab palette reduction."
+version = "2.0.0"
+description = "Refine Krea 2 and MiniMax H3 output with mode-based pixel-grid collapse and perceptual OKLab palette reduction."
 requires-python = ">=3.10"
 dependencies = []
 classifiers = [
@@ -15,4 +15,4 @@ Documentation = "https://github.com/envy-ai/ComfyUI-Krea2-Pixel-Art-Refiner#read
 
 [tool.comfy]
 PublisherId = "envy-ai"
-DisplayName = "Krea 2 Pixel Art Refiner"
+DisplayName = "Krea 2 and MiniMax H3 Pixel Art Refiners"

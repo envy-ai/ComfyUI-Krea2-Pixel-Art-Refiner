@@ -295,14 +295,14 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
     return output
 
 
-class Krea2PixelArtRefiner(io.ComfyNode):
+class MiniMaxH3PixelArtRefiner(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="Krea2PixelArtRefiner",
-            display_name="Krea 2 Pixel Art Refiner",
+            node_id="MiniMaxH3PixelArtRefiner",
+            display_name="MiniMax H3 Pixel Art Refiner",
             description="Combines perceptual palette reduction with a modal pixel-grid collapse in a selectable order.",
-            category="image/krea2",
+            category="image/minimax",
             inputs=[
                 io.Image.Input("image"),
                 io.Int.Input("width", default=64, min=1, max=16384, step=1,
@@ -336,7 +336,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                 shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0, auto_offset=False):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
-            raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
+            raise ValueError(f"MiniMax H3 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
         if palette_image is not None and palette_image.shape[-1] < 3:
             raise ValueError(f"Palette image requires at least 3 image channels, got {palette_image.shape[-1]}")
         if width > image_width or height > image_height:
@@ -357,3 +357,45 @@ class Krea2PixelArtRefiner(io.ComfyNode):
         collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset,
                                              detected_offsets)
         return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))
+
+
+class Krea2PixelArtRefiner(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Krea2PixelArtRefiner",
+            display_name="Krea 2 Pixel Art Refiner",
+            description="Combines perceptual palette reduction with a modal pixel-grid collapse in a selectable order.",
+            category="image/krea2",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("width", default=64, min=1, max=16384, step=1,
+                             tooltip="Number of logical pixels across the refined image."),
+                io.Int.Input("height", default=64, min=1, max=16384, step=1,
+                             tooltip="Number of logical pixels down the refined image."),
+                io.Int.Input("colors", default=24, min=2, max=256, step=1,
+                             tooltip="Maximum number of colors in each image's palette."),
+                io.Boolean.Input("color_reduction_first", default=True,
+                                 tooltip="Reduce the palette before grid collapse. Disable for collapse-then-reduce behavior."),
+                io.Boolean.Input("scale_to_original", default=True,
+                                 tooltip="Expand the logical pixel grid back to the input dimensions."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original):
+        image_height, image_width = image.shape[1:3]
+        if image.shape[-1] < 3:
+            raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
+        if width > image_width or height > image_height:
+            raise ValueError(f"Logical grid {width}x{height} cannot exceed image size {image_width}x{image_height}")
+        if image_width % width != 0 or image_height % height != 0:
+            raise ValueError(f"Image size {image_width}x{image_height} must be divisible by logical grid {width}x{height}")
+
+        if color_reduction_first:
+            reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image])
+            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original))
+
+        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original)
+        return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed]))
