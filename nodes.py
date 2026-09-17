@@ -181,13 +181,59 @@ def select_modal_pixels(pixels, cell_ids, cell_count, center_pixels):
     return pixels[first_positions]
 
 
+def detect_axis_offsets(edge_energy, size, logical_size):
+    candidate_count = max(1, (size + logical_size - 1) // logical_size)
+    if logical_size == 1 or candidate_count == 1:
+        return torch.zeros(edge_energy.shape[0], dtype=torch.long, device=edge_energy.device)
+
+    period = max(1, round(size / logical_size))
+    periodic_energy = torch.zeros_like(edge_energy)
+    if period < edge_energy.shape[1]:
+        paired_energy = (edge_energy[:, :-period] * edge_energy[:, period:]).sqrt()
+        periodic_energy[:, :-period] += paired_energy
+        periodic_energy[:, period:] += paired_energy
+    else:
+        periodic_energy = edge_energy
+
+    boundaries = torch.arange(logical_size, device=edge_energy.device) * size // logical_size
+    scores = []
+    for offset in range(candidate_count):
+        positions = (boundaries + offset) % size
+        positions = positions[positions > 0]
+        scores.append(periodic_energy[:, positions - 1].mean(dim=1))
+    return torch.stack(scores, dim=1).argmax(dim=1)
+
+
+def detect_pixel_grid_offsets(image, logical_width, logical_height):
+    rgb = image[..., :3]
+    horizontal_edges = (rgb[:, :, 1:] - rgb[:, :, :-1]).abs().mean(dim=(1, 3))
+    vertical_edges = (rgb[:, 1:] - rgb[:, :-1]).abs().mean(dim=(2, 3))
+    column_offsets = detect_axis_offsets(horizontal_edges, image.shape[2], logical_width)
+    row_offsets = detect_axis_offsets(vertical_edges, image.shape[1], logical_height)
+    return column_offsets, row_offsets
+
+
+def roll_image_batch(image, column_offsets, row_offsets, direction):
+    if not any(column_offsets) and not any(row_offsets):
+        return image
+    if len(set(column_offsets)) == 1 and len(set(row_offsets)) == 1:
+        return torch.roll(image, shifts=(direction * row_offsets[0], direction * column_offsets[0]), dims=(1, 2))
+    return torch.stack([
+        torch.roll(batch_image, shifts=(direction * row_offset, direction * column_offset), dims=(0, 1))
+        for batch_image, column_offset, row_offset in zip(image, column_offsets, row_offsets)
+    ])
+
+
 def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True, allow_uneven_grid=False,
-                             x_offset=0.0, y_offset=0.0):
+                             x_offset=0.0, y_offset=0.0, detected_offsets=None):
     batch_size, height, width, channels = image.shape
-    column_offset = int(x_offset * width / logical_width + 0.5)
-    row_offset = int(y_offset * height / logical_height + 0.5)
-    if column_offset or row_offset:
-        image = torch.roll(image, shifts=(-row_offset, -column_offset), dims=(1, 2))
+    if detected_offsets is None:
+        column_offsets = [int(x_offset * width / logical_width + 0.5)] * batch_size
+        row_offsets = [int(y_offset * height / logical_height + 0.5)] * batch_size
+    else:
+        column_offsets = detected_offsets[0].tolist()
+        row_offsets = detected_offsets[1].tolist()
+    image = roll_image_batch(image, column_offsets, row_offsets, -1)
 
     if allow_uneven_grid and (height % logical_height != 0 or width % logical_width != 0):
         row_bounds = torch.arange(logical_height + 1, device=image.device) * height // logical_height
@@ -221,9 +267,7 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
 
     if not scale_to_original:
         return logical
-    if column_offset or row_offset:
-        output = torch.roll(output, shifts=(row_offset, column_offset), dims=(1, 2))
-    return output
+    return roll_image_batch(output, column_offsets, row_offsets, 1)
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
@@ -254,6 +298,8 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                                tooltip="Shift the grid right by this fraction of one logical pixel."),
                 io.Float.Input("y_offset", default=0.0, min=0.0, max=1.0, step=0.01,
                                tooltip="Shift the grid down by this fraction of one logical pixel."),
+                io.Boolean.Input("auto_offset", default=False,
+                                 tooltip="Detect the X and Y grid phase separately for each image. Overrides x_offset and y_offset."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use the unique colors in this image as the palette for the entire batch. Overrides colors and shared_palette."),
             ],
@@ -262,7 +308,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False,
-                shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0):
+                shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0, auto_offset=False):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
@@ -276,11 +322,13 @@ class Krea2PixelArtRefiner(io.ComfyNode):
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], image.dtype, image.device)
+        detected_offsets = detect_pixel_grid_offsets(image, width, height) if auto_offset else None
 
         if color_reduction_first:
             reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
             return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid,
-                                                          x_offset, y_offset))
+                                                          x_offset, y_offset, detected_offsets))
 
-        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset)
+        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset,
+                                             detected_offsets)
         return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))
