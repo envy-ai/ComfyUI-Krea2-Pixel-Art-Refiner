@@ -1,5 +1,3 @@
-from math import ceil
-
 import cv2
 import numpy as np
 import torch
@@ -373,31 +371,20 @@ def usable_mesh(mesh):
     return len(lines_x) >= 2 and len(lines_y) >= 2 and not (len(lines_x) in (2, 3) and len(lines_y) in (2, 3))
 
 
-def aggregate_edge_maps(images, scale):
-    votes = None
-    for frame in images:
-        edges = frame_edge_map(frame, scale)
-        if votes is None:
-            votes = np.zeros(edges.shape, dtype=np.int32)
-        votes += edges > 0
-    minimum_votes = max(1, ceil(0.25 * images.shape[0]))
-    return ((votes >= minimum_votes) * 255).astype(np.uint8)
-
-
 def regular_mesh(image_width, image_height, logical_width, logical_height):
     lines_x = [round(index * image_width / logical_width) for index in range(logical_width + 1)]
     lines_y = [round(index * image_height / logical_height) for index in range(logical_height + 1)]
     return lines_x, lines_y
 
 
-def detect_pixel_mesh(images, fallback_width, fallback_height):
-    mesh = mesh_from_edges(aggregate_edge_maps(images, 2))
+def detect_pixel_mesh(frame, fallback_width, fallback_height):
+    mesh = mesh_from_edges(frame_edge_map(frame, 2))
     if usable_mesh(mesh):
         return mesh, 2
-    mesh = mesh_from_edges(aggregate_edge_maps(images, 1))
+    mesh = mesh_from_edges(frame_edge_map(frame, 1))
     if usable_mesh(mesh):
         return mesh, 1
-    return regular_mesh(images.shape[2], images.shape[1], fallback_width, fallback_height), 1
+    return regular_mesh(frame.shape[1], frame.shape[0], fallback_width, fallback_height), 1
 
 
 def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
@@ -473,6 +460,19 @@ def fit_frame_to_size(frame, width, height):
     top = (height - scaled_height) // 2
     left = (width - scaled_width) // 2
     output[top:top + scaled_height, left:left + scaled_width] = scaled
+    return output
+
+
+def pad_frames(frames):
+    height = max(frame.shape[0] for frame in frames)
+    width = max(frame.shape[1] for frame in frames)
+    output = []
+    for frame in frames:
+        padded = torch.zeros((height, width, 4), dtype=frame.dtype, device=frame.device)
+        top = (height - frame.shape[0]) // 2
+        left = (width - frame.shape[1]) // 2
+        padded[top:top + frame.shape[0], left:left + frame.shape[1]] = frame
+        output.append(padded)
     return output
 
 
@@ -583,14 +583,15 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
-        mesh, mesh_scale = detect_pixel_mesh(image, width, height)
         reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
-        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
+        meshes = [detect_pixel_mesh(frame, width, height) for frame in image]
+        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale)
+                     for frame, (mesh, mesh_scale) in zip(reduced, meshes)]
 
         if scale_to_original:
             output = [fit_frame_to_size(frame, image.shape[2], image.shape[1]) for frame in collapsed]
             return io.NodeOutput(composite_white(torch.stack(output)))
-        return io.NodeOutput(composite_white(torch.stack(collapsed)))
+        return io.NodeOutput(composite_white(torch.stack(pad_frames(collapsed))))
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
