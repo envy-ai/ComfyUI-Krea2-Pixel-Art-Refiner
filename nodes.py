@@ -181,8 +181,14 @@ def select_modal_pixels(pixels, cell_ids, cell_count, center_pixels):
     return pixels[first_positions]
 
 
-def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True, allow_uneven_grid=False):
+def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True, allow_uneven_grid=False,
+                             x_offset=0.0, y_offset=0.0):
     batch_size, height, width, channels = image.shape
+    column_offset = int(x_offset * width / logical_width + 0.5)
+    row_offset = int(y_offset * height / logical_height + 0.5)
+    if column_offset or row_offset:
+        image = torch.roll(image, shifts=(-row_offset, -column_offset), dims=(1, 2))
+
     if allow_uneven_grid and (height % logical_height != 0 or width % logical_width != 0):
         row_bounds = torch.arange(logical_height + 1, device=image.device) * height // logical_height
         column_bounds = torch.arange(logical_width + 1, device=image.device) * width // logical_width
@@ -197,23 +203,27 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
         center_pixels = image[:, center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
         selected = select_modal_pixels(image.reshape(-1, channels), cell_ids, batch_size * cells_per_image, center_pixels)
         logical = selected.reshape(batch_size, logical_height, logical_width, channels)
-        if not scale_to_original:
-            return logical
-        return logical.index_select(1, row_ids).index_select(2, column_ids)
+        if scale_to_original:
+            output = logical.index_select(1, row_ids).index_select(2, column_ids)
+    else:
+        block_height = height // logical_height
+        block_width = width // logical_width
+        block_pixels = block_height * block_width
+        cells = image.reshape(batch_size, logical_height, block_height, logical_width, block_width, channels)
+        cells = cells.permute(0, 1, 3, 2, 4, 5).reshape(-1, block_pixels, channels)
+        cell_count = cells.shape[0]
+        cell_ids = torch.arange(cell_count, device=image.device)[:, None].expand(cell_count, block_pixels).reshape(-1)
+        center_index = (block_height // 2) * block_width + block_width // 2
+        selected = select_modal_pixels(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
+        logical = selected.reshape(batch_size, logical_height, logical_width, channels)
+        if scale_to_original:
+            output = logical.repeat_interleave(block_height, dim=1).repeat_interleave(block_width, dim=2)
 
-    block_height = height // logical_height
-    block_width = width // logical_width
-    block_pixels = block_height * block_width
-    cells = image.reshape(batch_size, logical_height, block_height, logical_width, block_width, channels)
-    cells = cells.permute(0, 1, 3, 2, 4, 5).reshape(-1, block_pixels, channels)
-    cell_count = cells.shape[0]
-    cell_ids = torch.arange(cell_count, device=image.device)[:, None].expand(cell_count, block_pixels).reshape(-1)
-    center_index = (block_height // 2) * block_width + block_width // 2
-    selected = select_modal_pixels(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
-    logical = selected.reshape(batch_size, logical_height, logical_width, channels)
     if not scale_to_original:
         return logical
-    return logical.repeat_interleave(block_height, dim=1).repeat_interleave(block_width, dim=2)
+    if column_offset or row_offset:
+        output = torch.roll(output, shifts=(row_offset, column_offset), dims=(1, 2))
+    return output
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
@@ -240,6 +250,10 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                                  tooltip="Allow input dimensions that are not evenly divisible by the logical grid."),
                 io.Boolean.Input("shared_palette", default=False,
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each image."),
+                io.Float.Input("x_offset", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Shift the grid right by this fraction of one logical pixel."),
+                io.Float.Input("y_offset", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Shift the grid down by this fraction of one logical pixel."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use the unique colors in this image as the palette for the entire batch. Overrides colors and shared_palette."),
             ],
@@ -248,7 +262,7 @@ class Krea2PixelArtRefiner(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False,
-                shared_palette=False, palette_image=None):
+                shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
@@ -265,7 +279,8 @@ class Krea2PixelArtRefiner(io.ComfyNode):
 
         if color_reduction_first:
             reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
-            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid))
+            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid,
+                                                          x_offset, y_offset))
 
-        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid)
+        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset)
         return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))
