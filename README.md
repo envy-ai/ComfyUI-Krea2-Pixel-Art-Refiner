@@ -13,6 +13,8 @@ Disable `color_reduction_first` to reverse the order and collapse the grid befor
 
 By default the result is expanded back to the input dimensions with nearest-neighbor scaling. Disable `scale_to_original` to return the logical grid at exactly `width × height`. The node supports image batches and alpha channels and uses only PyTorch supplied by ComfyUI.
 
+Input dimensions must normally divide evenly into the logical grid. Enable `allow_uneven_grid` to distribute remainder rows and columns across the grid while preserving the full image and its original dimensions.
+
 ## Installation
 
 ```bash
@@ -34,8 +36,9 @@ Find **Krea 2 Pixel Art Refiner** under `image/krea2`.
 | `colors` | 24 | Maximum colors selected separately for each image. |
 | `color_reduction_first` | On | Reduce colors before collapsing the pixel grid. |
 | `scale_to_original` | On | Expand the logical grid back to the input dimensions. |
+| `allow_uneven_grid` | Off | Permit grid cells of slightly different sizes when the input dimensions do not divide evenly. |
 
-The input width and height must be evenly divisible by the requested logical width and height.
+When `allow_uneven_grid` is disabled, the input width and height must be evenly divisible by the requested logical width and height.
 
 Typical wiring:
 

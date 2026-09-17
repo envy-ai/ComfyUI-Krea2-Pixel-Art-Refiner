@@ -1,6 +1,6 @@
 [project]
 name = "krea2-pixel-art-refiner"
-version = "1.0.0"
+version = "1.1.0"
 description = "Refine Krea 2 output with mode-based pixel-grid collapse and perceptual OKLab palette reduction."
 requires-python = ">=3.10"
 dependencies = []

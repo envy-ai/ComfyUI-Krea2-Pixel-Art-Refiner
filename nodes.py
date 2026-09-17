@@ -92,23 +92,15 @@ def reduce_image_palette(image, color_count):
     return torch.cat((reduced_rgb, image[..., 3:]), dim=-1)
 
 
-def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True):
-    batch_size, height, width, channels = image.shape
-    block_height = height // logical_height
-    block_width = width // logical_width
-    block_pixels = block_height * block_width
-    cells = image.reshape(batch_size, logical_height, block_height, logical_width, block_width, channels)
-    cells = cells.permute(0, 1, 3, 2, 4, 5).reshape(-1, block_pixels, channels)
-
-    rgb8 = (cells[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+def select_modal_pixels(pixels, cell_ids, cell_count, center_pixels):
+    rgb8 = (pixels[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
-    cell_ids = torch.arange(cells.shape[0], device=image.device)[:, None].expand_as(color_codes)
     color_keys = (cell_ids << 24) | color_codes
-    unique_keys, key_inverse, counts = torch.unique(color_keys.flatten(), return_inverse=True, return_counts=True)
+    unique_keys, key_inverse, counts = torch.unique(color_keys, return_inverse=True, return_counts=True)
     unique_cells = unique_keys >> 24
     unique_colors = unique_keys & 0xFFFFFF
 
-    max_counts = torch.zeros(cells.shape[0], dtype=counts.dtype, device=image.device)
+    max_counts = torch.zeros(cell_count, dtype=counts.dtype, device=pixels.device)
     max_counts.scatter_reduce_(0, unique_cells, counts, reduce="amax")
     modal = counts == max_counts[unique_cells]
 
@@ -116,20 +108,51 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
         (unique_colors >> 16) & 255,
         (unique_colors >> 8) & 255,
         unique_colors & 255,
-    ), dim=1).to(dtype=image.dtype) / 255.0
-    center_index = (block_height // 2) * block_width + block_width // 2
-    center_oklab = srgb_to_oklab(cells[:, center_index, :3].clamp(0.0, 1.0))
+    ), dim=1).to(dtype=pixels.dtype) / 255.0
+    center_oklab = srgb_to_oklab(center_pixels[..., :3].clamp(0.0, 1.0))
     candidate_oklab = srgb_to_oklab(candidate_rgb)
     distances = (candidate_oklab - center_oklab[unique_cells]).square().sum(dim=1)
     modal_distances = torch.where(modal, distances, torch.inf)
-    min_distances = torch.full((cells.shape[0],), torch.inf, dtype=image.dtype, device=image.device)
+    min_distances = torch.full((cell_count,), torch.inf, dtype=pixels.dtype, device=pixels.device)
     min_distances.scatter_reduce_(0, unique_cells, modal_distances, reduce="amin")
     closest = modal & torch.isclose(distances, min_distances[unique_cells], rtol=1e-5, atol=1e-8)
 
-    eligible = closest[key_inverse].reshape(cells.shape[0], block_pixels)
-    positions = torch.arange(block_pixels, device=image.device)[None, :].expand_as(eligible)
-    first_positions = torch.where(eligible, positions, block_pixels).min(dim=1).values
-    selected = cells[torch.arange(cells.shape[0], device=image.device), first_positions]
+    eligible = closest[key_inverse]
+    positions = torch.arange(pixels.shape[0], device=pixels.device)
+    first_positions = torch.full((cell_count,), pixels.shape[0], dtype=torch.long, device=pixels.device)
+    first_positions.scatter_reduce_(0, cell_ids, torch.where(eligible, positions, pixels.shape[0]), reduce="amin")
+    return pixels[first_positions]
+
+
+def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_original=True, allow_uneven_grid=False):
+    batch_size, height, width, channels = image.shape
+    if allow_uneven_grid and (height % logical_height != 0 or width % logical_width != 0):
+        row_bounds = torch.arange(logical_height + 1, device=image.device) * height // logical_height
+        column_bounds = torch.arange(logical_width + 1, device=image.device) * width // logical_width
+        row_ids = torch.repeat_interleave(torch.arange(logical_height, device=image.device), row_bounds[1:] - row_bounds[:-1])
+        column_ids = torch.repeat_interleave(torch.arange(logical_width, device=image.device), column_bounds[1:] - column_bounds[:-1])
+        cells_per_image = logical_height * logical_width
+        image_cells = row_ids[:, None] * logical_width + column_ids[None, :]
+        batch_cells = torch.arange(batch_size, device=image.device)[:, None, None] * cells_per_image
+        cell_ids = (batch_cells + image_cells).reshape(-1)
+        center_rows = row_bounds[:-1] + (row_bounds[1:] - row_bounds[:-1]) // 2
+        center_columns = column_bounds[:-1] + (column_bounds[1:] - column_bounds[:-1]) // 2
+        center_pixels = image[:, center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
+        selected = select_modal_pixels(image.reshape(-1, channels), cell_ids, batch_size * cells_per_image, center_pixels)
+        logical = selected.reshape(batch_size, logical_height, logical_width, channels)
+        if not scale_to_original:
+            return logical
+        return logical.index_select(1, row_ids).index_select(2, column_ids)
+
+    block_height = height // logical_height
+    block_width = width // logical_width
+    block_pixels = block_height * block_width
+    cells = image.reshape(batch_size, logical_height, block_height, logical_width, block_width, channels)
+    cells = cells.permute(0, 1, 3, 2, 4, 5).reshape(-1, block_pixels, channels)
+    cell_count = cells.shape[0]
+    cell_ids = torch.arange(cell_count, device=image.device)[:, None].expand(cell_count, block_pixels).reshape(-1)
+    center_index = (block_height // 2) * block_width + block_width // 2
+    selected = select_modal_pixels(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
     logical = selected.reshape(batch_size, logical_height, logical_width, channels)
     if not scale_to_original:
         return logical
@@ -156,23 +179,25 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                                  tooltip="Reduce the palette before grid collapse. Disable for collapse-then-reduce behavior."),
                 io.Boolean.Input("scale_to_original", default=True,
                                  tooltip="Expand the logical pixel grid back to the input dimensions."),
+                io.Boolean.Input("allow_uneven_grid", default=False,
+                                 tooltip="Allow input dimensions that are not evenly divisible by the logical grid."),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
-    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original):
+    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
         if width > image_width or height > image_height:
             raise ValueError(f"Logical grid {width}x{height} cannot exceed image size {image_width}x{image_height}")
-        if image_width % width != 0 or image_height % height != 0:
+        if not allow_uneven_grid and (image_width % width != 0 or image_height % height != 0):
             raise ValueError(f"Image size {image_width}x{image_height} must be divisible by logical grid {width}x{height}")
 
         if color_reduction_first:
             reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image])
-            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original))
+            return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid))
 
-        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original)
+        collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid)
         return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed]))
