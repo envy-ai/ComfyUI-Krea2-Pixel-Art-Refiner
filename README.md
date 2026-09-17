@@ -1,8 +1,8 @@
 # ComfyUI Pixel Art Refiners
 
-Two ComfyUI nodes that turn generated images and video frames into grid-aligned, limited-palette pixel art.
+Three ComfyUI nodes that turn generated images and video frames into grid-aligned, limited-palette pixel art.
 
-Both nodes select perceptual palettes with weighted OKLab clustering and collapse images to a logical pixel grid. Each grid cell uses its most frequent 8-bit RGB color. Ties are resolved by choosing the color perceptually closest to the cell's center pixel in OKLab; any remaining tie uses the first matching pixel in raster order.
+All three nodes select perceptual palettes with weighted OKLab clustering and collapse images to a logical pixel grid. Each grid cell uses its most frequent 8-bit RGB color. Ties are resolved by choosing the color perceptually closest to the cell's center pixel in OKLab; any remaining tie uses the first matching pixel in raster order.
 
 ## Installation
 
@@ -52,6 +52,29 @@ Manual offsets range from `0.0` to `1.0`; for example, `0.5` shifts the grid by 
 Automatic offset detection finds the strongest repeating X and Y edge phases separately for every image. Flat margins contribute negligible periodic evidence. An axis with no detectable repetition falls back to zero.
 
 When a palette image contains no more than `colors` unique RGB values, those exact colors are retained. Larger palettes are perceptually reduced first. The first input image's upper-left RGB color is then added so a differing background remains available.
+
+## MiniMax H3 Pixel Art Autorefiner
+
+Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It automatically extracts and processes separate sprites from each frame:
+
+1. Reduce the frame to the requested perceptual palette.
+2. Treat the upper-left color as transparent and find eight-connected visible blobs larger than 25 source pixels.
+3. Detect each blob's horizontal and vertical pixel period.
+4. Collapse each detected pixel cell with the same modal-color and center-pixel tie breaking used by the other refiners.
+5. Center each collapsed blob on a transparent `width × height` canvas and concatenate the canvases horizontally.
+6. Optionally scale and pad the strip to the original frame dimensions, then composite it on white.
+
+| Input | Default | Description |
+| --- | ---: | --- |
+| `image` | — | ComfyUI image, video-frame batch, or image batch. |
+| `width` | 64 | Logical canvas width for each extracted blob. |
+| `height` | 64 | Logical canvas height for each extracted blob. |
+| `colors` | 24 | Maximum generated or reduced palette size. |
+| `scale_to_original` | On | Fit each strip inside the original frame and pad it to the original dimensions. |
+| `shared_palette` | Off | Generate one palette across the input batch. |
+| `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
+
+With `scale_to_original` disabled, frames with fewer blobs are padded with empty white slots so every image in the output batch has the same dimensions.
 
 Typical wiring:
 

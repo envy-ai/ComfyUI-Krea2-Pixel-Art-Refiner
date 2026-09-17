@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from comfy_api.latest import io
@@ -295,6 +296,246 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
     return output
 
 
+def visible_components(mask, minimum_area=25):
+    mask = mask.detach().to(device="cpu").numpy()
+    parents = []
+    runs = []
+    previous = []
+
+    def find(label):
+        while parents[label] != label:
+            parents[label] = parents[parents[label]]
+            label = parents[label]
+        return label
+
+    def union(first, second):
+        first = find(first)
+        second = find(second)
+        if first != second:
+            parents[max(first, second)] = min(first, second)
+
+    for row_index, row in enumerate(mask):
+        padded = np.pad(row, (1, 1))
+        changes = np.diff(padded.astype(np.int8))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1)
+        current = []
+        previous_index = 0
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            label = len(parents)
+            parents.append(label)
+            while previous_index < len(previous) and previous[previous_index][1] < start:
+                previous_index += 1
+            overlap_index = previous_index
+            while overlap_index < len(previous) and previous[overlap_index][0] <= end:
+                union(label, previous[overlap_index][2])
+                overlap_index += 1
+            current.append((start, end, label))
+            runs.append((row_index, start, end, label))
+        previous = current
+
+    components = {}
+    for row, start, end, label in runs:
+        root = find(label)
+        component = components.setdefault(root, {
+            "area": 0,
+            "top": row,
+            "bottom": row + 1,
+            "left": start,
+            "right": end,
+            "runs": [],
+        })
+        component["area"] += end - start
+        component["top"] = min(component["top"], row)
+        component["bottom"] = max(component["bottom"], row + 1)
+        component["left"] = min(component["left"], start)
+        component["right"] = max(component["right"], end)
+        component["runs"].append((row, start, end))
+
+    return sorted(
+        (component for component in components.values() if component["area"] > minimum_area),
+        key=lambda component: (component["top"], component["left"]),
+    )
+
+
+def component_mask(component, device):
+    height = component["bottom"] - component["top"]
+    width = component["right"] - component["left"]
+    mask = np.zeros((height, width), dtype=np.bool_)
+    for row, start, end in component["runs"]:
+        mask[row - component["top"], start - component["left"]:end - component["left"]] = True
+    return torch.from_numpy(mask).to(device=device)
+
+
+def estimate_pixel_period(color_codes):
+    color_codes = color_codes.detach().to(device="cpu").numpy()
+    size = color_codes.shape[1]
+    if size < 4:
+        return 1, 0
+
+    run_lengths = []
+    for row in color_codes:
+        starts = np.concatenate(([0], np.flatnonzero(row[1:] != row[:-1]) + 1))
+        ends = np.concatenate((starts[1:], [size]))
+        run_lengths.extend((ends - starts)[row[starts] >= 0].tolist())
+    if not run_lengths:
+        return 1, 0
+
+    counts = np.bincount(run_lengths, minlength=size + 1)
+    weighted_counts = counts * np.arange(counts.shape[0])
+    maximum_period = min(size // 2, counts.shape[0] - 1)
+    period = 1
+    for candidate in range(2, maximum_period + 1):
+        previous = weighted_counts[candidate - 1]
+        following = weighted_counts[candidate + 1] if candidate < maximum_period else 0
+        if counts[candidate] > 1 and weighted_counts[candidate] > previous and weighted_counts[candidate] >= following:
+            period = candidate
+            break
+    if period == 1:
+        return 1, 0
+
+    edges = (color_codes[:, 1:] != color_codes[:, :-1]).sum(axis=0)
+    best_period = period
+    best_correlation = -1.0
+    for candidate in range(max(2, period - 1), min(maximum_period, period + 1) + 1):
+        first = edges[:-candidate]
+        second = edges[candidate:]
+        denominator = np.sqrt(np.dot(first, first) * np.dot(second, second))
+        correlation = np.dot(first, second) / denominator if denominator > 0 else 0.0
+        if correlation > best_correlation:
+            best_period = candidate
+            best_correlation = correlation
+    period = best_period
+    positions = np.flatnonzero(edges > 0) + 1
+    residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
+    return period, int(residue_energy.argmax())
+
+
+def blob_periods(blob):
+    rgb8 = (blob[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
+    color_codes = torch.where(blob[..., 3] > 0, color_codes, -1)
+    period_x, phase_x = estimate_pixel_period(color_codes)
+    period_y, phase_y = estimate_pixel_period(color_codes.transpose(0, 1))
+    return period_x, phase_x, period_y, phase_y
+
+
+def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
+    rgba8 = (pixels[..., :4].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgba8[..., 0] << 24) | (rgba8[..., 1] << 16) | (rgba8[..., 2] << 8) | rgba8[..., 3]
+    color_keys = (cell_ids << 32) | color_codes
+    unique_keys, key_inverse, counts = torch.unique(color_keys, return_inverse=True, return_counts=True)
+    unique_cells = unique_keys >> 32
+    unique_colors = unique_keys & 0xFFFFFFFF
+
+    max_counts = torch.zeros(cell_count, dtype=counts.dtype, device=pixels.device)
+    max_counts.scatter_reduce_(0, unique_cells, counts, reduce="amax")
+    modal = counts == max_counts[unique_cells]
+
+    candidate_rgba = torch.stack((
+        (unique_colors >> 24) & 255,
+        (unique_colors >> 16) & 255,
+        (unique_colors >> 8) & 255,
+        unique_colors & 255,
+    ), dim=1).to(dtype=pixels.dtype) / 255.0
+    center_oklab = srgb_to_oklab(center_pixels[..., :3].clamp(0.0, 1.0))
+    candidate_oklab = srgb_to_oklab(candidate_rgba[:, :3])
+    distances = (candidate_oklab - center_oklab[unique_cells]).square().sum(dim=1)
+    distances += (candidate_rgba[:, 3] - center_pixels[unique_cells, 3]).square()
+    modal_distances = torch.where(modal, distances, torch.inf)
+    min_distances = torch.full((cell_count,), torch.inf, dtype=pixels.dtype, device=pixels.device)
+    min_distances.scatter_reduce_(0, unique_cells, modal_distances, reduce="amin")
+    closest = modal & torch.isclose(distances, min_distances[unique_cells], rtol=1e-5, atol=1e-8)
+
+    eligible = closest[key_inverse]
+    positions = torch.arange(pixels.shape[0], device=pixels.device)
+    first_positions = torch.full((cell_count,), pixels.shape[0], dtype=torch.long, device=pixels.device)
+    first_positions.scatter_reduce_(0, cell_ids, torch.where(eligible, positions, pixels.shape[0]), reduce="amin")
+    return pixels[first_positions]
+
+
+def collapse_blob(blob, period_x, phase_x, period_y, phase_y):
+    height, width, channels = blob.shape
+    left = (period_x - phase_x) % period_x
+    top = (period_y - phase_y) % period_y
+    padded_width = left + width
+    padded_height = top + height
+    right = (-padded_width) % period_x
+    bottom = (-padded_height) % period_y
+    aligned = torch.zeros((padded_height + bottom, padded_width + right, channels), dtype=blob.dtype, device=blob.device)
+    aligned[top:top + height, left:left + width] = blob
+
+    logical_height = aligned.shape[0] // period_y
+    logical_width = aligned.shape[1] // period_x
+    cells = aligned.reshape(logical_height, period_y, logical_width, period_x, channels)
+    cells = cells.permute(0, 2, 1, 3, 4).reshape(-1, period_y * period_x, channels)
+    cell_count = cells.shape[0]
+    cell_ids = torch.arange(cell_count, device=blob.device)[:, None].expand_as(cells[..., 0]).reshape(-1)
+    center_index = (period_y // 2) * period_x + period_x // 2
+    selected = select_modal_rgba(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
+    logical = selected.reshape(logical_height, logical_width, channels)
+    visible = logical[..., 3] > 0
+    if not torch.any(visible):
+        return None
+    rows, columns = torch.where(visible)
+    return logical[rows.min():rows.max() + 1, columns.min():columns.max() + 1]
+
+
+def pad_blob(blob, width, height):
+    blob_height, blob_width = blob.shape[:2]
+    if blob_width > width or blob_height > height:
+        raise ValueError(f"Collapsed blob size {blob_width}x{blob_height} exceeds target size {width}x{height}")
+    output = torch.zeros((height, width, 4), dtype=blob.dtype, device=blob.device)
+    top = (height - blob_height) // 2
+    left = (width - blob_width) // 2
+    output[top:top + blob_height, left:left + blob_width] = blob
+    return output
+
+
+def extract_frame_blobs(image, width, height):
+    rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
+    background = color_codes == color_codes[0, 0]
+    visible = ~background
+    if image.shape[-1] > 3:
+        visible &= image[..., 3] > 0
+
+    rgba = torch.zeros((*image.shape[:2], 4), dtype=image.dtype, device=image.device)
+    rgba[..., :3] = image[..., :3]
+    rgba[..., 3] = visible.to(dtype=image.dtype)
+    blobs = []
+    for component in visible_components(visible):
+        top, bottom = component["top"], component["bottom"]
+        left, right = component["left"], component["right"]
+        mask = component_mask(component, image.device)
+        blob = rgba[top:bottom, left:right].clone()
+        blob *= mask[..., None]
+        period_x, phase_x, period_y, phase_y = blob_periods(blob)
+        collapsed = collapse_blob(blob, period_x, phase_x, period_y, phase_y)
+        if collapsed is not None:
+            blobs.append(pad_blob(collapsed, width, height))
+    return blobs
+
+
+def fit_strip_to_frame(strip, width, height):
+    scale = min(width / strip.shape[1], height / strip.shape[0])
+    scaled_width = max(1, min(width, round(strip.shape[1] * scale)))
+    scaled_height = max(1, min(height, round(strip.shape[0] * scale)))
+    scaled = torch.nn.functional.interpolate(
+        strip.permute(2, 0, 1).unsqueeze(0), size=(scaled_height, scaled_width), mode="nearest-exact"
+    )[0].permute(1, 2, 0)
+    output = torch.zeros((height, width, 4), dtype=strip.dtype, device=strip.device)
+    top = (height - scaled_height) // 2
+    left = (width - scaled_width) // 2
+    output[top:top + scaled_height, left:left + scaled_width] = scaled
+    return output
+
+
+def composite_white(image):
+    alpha = image[..., 3:4].clamp(0.0, 1.0)
+    return image[..., :3] * alpha + (1.0 - alpha)
+
+
 class MiniMaxH3PixelArtRefiner(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -357,6 +598,63 @@ class MiniMaxH3PixelArtRefiner(io.ComfyNode):
         collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset,
                                              detected_offsets)
         return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))
+
+
+class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3PixelArtAutorefiner",
+            display_name="MiniMax H3 Pixel Art Autorefiner",
+            description="Finds visible blobs, detects their pixel periods, collapses and packs them into sprite strips.",
+            category="image/minimax",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("width", default=64, min=1, max=16384, step=1,
+                             tooltip="Width of the transparent canvas allocated to each collapsed blob."),
+                io.Int.Input("height", default=64, min=1, max=16384, step=1,
+                             tooltip="Height of the transparent canvas allocated to each collapsed blob."),
+                io.Int.Input("colors", default=24, min=2, max=256, step=1,
+                             tooltip="Maximum generated or supplied palette size."),
+                io.Boolean.Input("scale_to_original", default=True,
+                                 tooltip="Scale each sprite strip to fit and pad it to the input frame dimensions."),
+                io.Boolean.Input("shared_palette", default=False,
+                                 tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
+                io.Image.Input("palette_image", optional=True,
+                               tooltip="Use this image's colors as the palette for the entire batch. Overrides shared_palette."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, image, width, height, colors, scale_to_original, shared_palette=False, palette_image=None):
+        if image.shape[-1] < 3:
+            raise ValueError(f"MiniMax H3 pixel art autorefiner requires at least 3 image channels, got {image.shape[-1]}")
+        if palette_image is not None and palette_image.shape[-1] < 3:
+            raise ValueError(f"Palette image requires at least 3 image channels, got {palette_image.shape[-1]}")
+
+        fixed_palette = None
+        if palette_image is not None:
+            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
+        reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
+        frame_blobs = [extract_frame_blobs(frame, width, height) for frame in reduced]
+
+        if scale_to_original:
+            output = []
+            for blobs in frame_blobs:
+                if blobs:
+                    strip = torch.cat(blobs, dim=1)
+                else:
+                    strip = torch.zeros((height, width, 4), dtype=image.dtype, device=image.device)
+                output.append(fit_strip_to_frame(strip, image.shape[2], image.shape[1]))
+            return io.NodeOutput(composite_white(torch.stack(output)))
+
+        blob_count = max(1, max((len(blobs) for blobs in frame_blobs), default=0))
+        empty_blob = torch.zeros((height, width, 4), dtype=image.dtype, device=image.device)
+        output = []
+        for blobs in frame_blobs:
+            output.append(torch.cat(blobs + [empty_blob] * (blob_count - len(blobs)), dim=1))
+        return io.NodeOutput(composite_white(torch.stack(output)))
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
