@@ -66,7 +66,7 @@ def perceptual_palette(colors, counts, color_count):
     return palette
 
 
-def reduce_image_palette(image, color_count):
+def unique_image_colors(image):
     rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
     unique_codes, inverse, counts = torch.unique(color_codes.flatten(), return_inverse=True, return_counts=True)
@@ -76,6 +76,19 @@ def reduce_image_palette(image, color_count):
         unique_codes & 255,
     ), dim=1).to(dtype=image.dtype) / 255.0
     unique_oklab = srgb_to_oklab(unique_rgb)
+    return unique_codes, inverse, counts, unique_oklab
+
+
+def map_unique_colors(image, inverse, unique_oklab, palette_oklab, palette_rgb):
+    labels = nearest_palette_labels(unique_oklab, palette_oklab)
+    reduced_rgb = palette_rgb[labels[inverse]].reshape(image.shape[0], image.shape[1], 3)
+    if image.shape[-1] == 3:
+        return reduced_rgb
+    return torch.cat((reduced_rgb, image[..., 3:]), dim=-1)
+
+
+def reduce_image_palette(image, color_count):
+    unique_codes, inverse, counts, unique_oklab = unique_image_colors(image)
     if unique_codes.shape[0] > PALETTE_TRAINING_COLORS:
         positions = torch.linspace(0, inverse.shape[0] - 1, PALETTE_TRAINING_COLORS, device=image.device).round().long()
         training_indices, training_counts = torch.unique(inverse[positions], return_counts=True)
@@ -84,12 +97,56 @@ def reduce_image_palette(image, color_count):
         training_oklab = unique_oklab
         training_counts = counts
     palette_oklab = perceptual_palette(training_oklab, training_counts, color_count)
-    labels = nearest_palette_labels(unique_oklab, palette_oklab)
     palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
-    reduced_rgb = palette_rgb[labels[inverse]].reshape(image.shape[0], image.shape[1], 3)
-    if image.shape[-1] == 3:
-        return reduced_rgb
-    return torch.cat((reduced_rgb, image[..., 3:]), dim=-1)
+    return map_unique_colors(image, inverse, unique_oklab, palette_oklab, palette_rgb)
+
+
+def shared_perceptual_palette(images, color_count):
+    pixels = images[..., :3].reshape(-1, 3)
+    sample_count = min(PALETTE_TRAINING_COLORS, pixels.shape[0])
+    if sample_count < pixels.shape[0]:
+        positions = torch.linspace(0, pixels.shape[0] - 1, sample_count, dtype=torch.float64, device=images.device).round().long()
+        pixels = pixels[positions]
+    rgb8 = (pixels.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
+    unique_codes, counts = torch.unique(color_codes, return_counts=True)
+    unique_rgb = torch.stack((
+        (unique_codes >> 16) & 255,
+        (unique_codes >> 8) & 255,
+        unique_codes & 255,
+    ), dim=1).to(dtype=images.dtype) / 255.0
+    return perceptual_palette(srgb_to_oklab(unique_rgb), counts, color_count)
+
+
+def palette_from_image(palette_image, additional_color, dtype, device):
+    palette_pixels = palette_image[..., :3].to(device=device, dtype=dtype).reshape(-1, 3)
+    palette_pixels = torch.cat((palette_pixels, additional_color.to(device=device, dtype=dtype).reshape(1, 3)))
+    rgb8 = (palette_pixels.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
+    unique_codes = torch.unique(color_codes)
+    palette_rgb = torch.stack((
+        (unique_codes >> 16) & 255,
+        (unique_codes >> 8) & 255,
+        unique_codes & 255,
+    ), dim=1).to(dtype=dtype) / 255.0
+    return palette_rgb, srgb_to_oklab(palette_rgb)
+
+
+def reduce_image_batch(images, color_count, shared_palette=False, fixed_palette=None):
+    if fixed_palette is None and not shared_palette:
+        return torch.stack([reduce_image_palette(image, color_count) for image in images])
+
+    if fixed_palette is None:
+        palette_oklab = shared_perceptual_palette(images, color_count)
+        palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
+    else:
+        palette_rgb, palette_oklab = fixed_palette
+
+    output = torch.empty_like(images)
+    for index, image in enumerate(images):
+        _, inverse, _, unique_oklab = unique_image_colors(image)
+        output[index] = map_unique_colors(image, inverse, unique_oklab, palette_oklab, palette_rgb)
+    return output
 
 
 def select_modal_pixels(pixels, cell_ids, cell_count, center_pixels):
@@ -181,23 +238,34 @@ class Krea2PixelArtRefiner(io.ComfyNode):
                                  tooltip="Expand the logical pixel grid back to the input dimensions."),
                 io.Boolean.Input("allow_uneven_grid", default=False,
                                  tooltip="Allow input dimensions that are not evenly divisible by the logical grid."),
+                io.Boolean.Input("shared_palette", default=False,
+                                 tooltip="Generate one palette from the entire image batch instead of a separate palette for each image."),
+                io.Image.Input("palette_image", optional=True,
+                               tooltip="Use the unique colors in this image as the palette for the entire batch. Overrides colors and shared_palette."),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
-    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False):
+    def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False,
+                shared_palette=False, palette_image=None):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"Krea 2 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
+        if palette_image is not None and palette_image.shape[-1] < 3:
+            raise ValueError(f"Palette image requires at least 3 image channels, got {palette_image.shape[-1]}")
         if width > image_width or height > image_height:
             raise ValueError(f"Logical grid {width}x{height} cannot exceed image size {image_width}x{image_height}")
         if not allow_uneven_grid and (image_width % width != 0 or image_height % height != 0):
             raise ValueError(f"Image size {image_width}x{image_height} must be divisible by logical grid {width}x{height}")
 
+        fixed_palette = None
+        if palette_image is not None:
+            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], image.dtype, image.device)
+
         if color_reduction_first:
-            reduced = torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image])
+            reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
             return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid))
 
         collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid)
-        return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in collapsed]))
+        return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))

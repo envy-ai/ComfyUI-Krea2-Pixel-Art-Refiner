@@ -15,6 +15,8 @@ By default the result is expanded back to the input dimensions with nearest-neig
 
 Input dimensions must normally divide evenly into the logical grid. Enable `allow_uneven_grid` to distribute remainder rows and columns across the grid while preserving the full image and its original dimensions.
 
+Enable `shared_palette` to generate one palette from the entire input batch and apply it to every image. Connect `palette_image` to use its unique RGB colors as the palette instead; this overrides `colors` and `shared_palette`. The upper-left RGB color of the first input image is always added to an image-supplied palette so a differing background remains available.
+
 ## Installation
 
 ```bash
@@ -37,6 +39,8 @@ Find **Krea 2 Pixel Art Refiner** under `image/krea2`.
 | `color_reduction_first` | On | Reduce colors before collapsing the pixel grid. |
 | `scale_to_original` | On | Expand the logical grid back to the input dimensions. |
 | `allow_uneven_grid` | Off | Permit grid cells of slightly different sizes when the input dimensions do not divide evenly. |
+| `shared_palette` | Off | Generate and apply one palette across the entire image batch. |
+| `palette_image` | — | Optional image whose unique RGB colors become the shared palette, plus the first input image's upper-left color. |
 
 When `allow_uneven_grid` is disabled, the input width and height must be evenly divisible by the requested logical width and height.
 
