@@ -75,7 +75,7 @@ The mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJ
 | `shared_palette` | On | Generate one palette across the input batch. |
 | `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
 
-Every image in a batch gets its own independently detected mesh. With `scale_to_original` disabled, frames are centered on a canvas large enough for the largest detected logical resolution so they can remain in one ComfyUI image batch.
+For image batches, the node detects the mesh from the first frame and applies that exact mesh to every later frame. This keeps sprite size and position stable across an animation without combining edge evidence from different frames. With `scale_to_original` disabled, the node returns the detected true pixel resolution.
 
 Typical wiring:
 

@@ -463,19 +463,6 @@ def fit_frame_to_size(frame, width, height):
     return output
 
 
-def pad_frames(frames):
-    height = max(frame.shape[0] for frame in frames)
-    width = max(frame.shape[1] for frame in frames)
-    output = []
-    for frame in frames:
-        padded = torch.zeros((height, width, 4), dtype=frame.dtype, device=frame.device)
-        top = (height - frame.shape[0]) // 2
-        left = (width - frame.shape[1]) // 2
-        padded[top:top + frame.shape[0], left:left + frame.shape[1]] = frame
-        output.append(padded)
-    return output
-
-
 def composite_white(image):
     alpha = image[..., 3:4].clamp(0.0, 1.0)
     return image[..., :3] * alpha + (1.0 - alpha)
@@ -583,15 +570,14 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
+        mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
         reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
-        meshes = [detect_pixel_mesh(frame, width, height) for frame in image]
-        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale)
-                     for frame, (mesh, mesh_scale) in zip(reduced, meshes)]
+        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
 
         if scale_to_original:
             output = [fit_frame_to_size(frame, image.shape[2], image.shape[1]) for frame in collapsed]
             return io.NodeOutput(composite_white(torch.stack(output)))
-        return io.NodeOutput(composite_white(torch.stack(pad_frames(collapsed))))
+        return io.NodeOutput(composite_white(torch.stack(collapsed)))
 
 
 class Krea2PixelArtRefiner(io.ComfyNode):
