@@ -59,7 +59,7 @@ Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It automaticall
 
 1. Reduce the frame to the requested perceptual palette.
 2. Treat the upper-left color as transparent and find eight-connected visible blobs larger than 25 source pixels.
-3. Detect one horizontal and vertical pixel period from all trimmed blobs in the input batch. The horizontal period stays within 10% of the vertical period, and both fit the requested logical resolution.
+3. Detect one vertical period from all trimmed blobs in the input batch, then detect a fractional horizontal period from each sprite's full-height source slice. Each horizontal period stays within 10% of the vertical period, and both fit the requested logical resolution.
 4. Collapse each detected pixel cell with the same modal-color and center-pixel tie breaking used by the other refiners.
 5. Center each collapsed blob on a transparent `width × height` canvas and concatenate the canvases horizontally.
 6. Optionally scale and pad the strip to the original frame dimensions, then composite it on white.

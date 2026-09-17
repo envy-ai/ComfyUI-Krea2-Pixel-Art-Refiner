@@ -420,15 +420,69 @@ def pixel_grid_phase(color_codes, period, maximum_logical_size):
     return 0
 
 
-def detect_blob_periods(blobs, maximum_width, maximum_height):
-    color_codes = [blob_color_codes(blob) for blob in blobs]
+def detect_vertical_period(blobs, maximum_width, maximum_height):
+    color_codes = [blob_color_codes(blob["image"]) for blob in blobs]
     period_y = estimate_pixel_period([codes.transpose(0, 1) for codes in color_codes], maximum_height)
-    minimum_period_x = max((codes.shape[1] + maximum_width - 1) // maximum_width for codes in color_codes)
-    period_y = max(period_y, (10 * minimum_period_x + 10) // 11)
-    minimum_period_x = max(minimum_period_x, (9 * period_y + 9) // 10)
-    maximum_period_x = max(minimum_period_x, 11 * period_y // 10)
-    period_x = estimate_pixel_period(color_codes, maximum_width, minimum_period_x, maximum_period_x)
-    return period_x, period_y
+    minimum_period_x = max(codes.shape[1] / maximum_width for codes in color_codes)
+    return max(period_y, int(np.ceil(minimum_period_x / 1.1)))
+
+
+def grid_axis(size, period, phase):
+    phase %= period
+    start = 0.0 if phase < 1e-6 else phase - period
+    leading_padding = int(round(-start))
+    required_size = leading_padding + size
+    boundaries = [0]
+    index = 1
+    while boundaries[-1] < required_size:
+        boundary = int(round(index * period))
+        boundaries.append(max(boundary, boundaries[-1] + 1))
+        index += 1
+    return leading_padding, boundaries
+
+
+def horizontal_edge_energy(image):
+    rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
+    if image.shape[-1] > 3:
+        color_codes = torch.where(image[..., 3] > 0, color_codes, -1)
+    return (color_codes[:, 1:] != color_codes[:, :-1]).sum(dim=0).to(device="cpu", dtype=torch.float64).numpy()
+
+
+def horizontal_grid(image_slice, slice_left, blob, period_y, maximum_width):
+    edge_energy = horizontal_edge_energy(image_slice)
+    if edge_energy.size == 0:
+        return float(period_y), 0.0
+    positions = np.arange(edge_energy.shape[0], dtype=np.float64)
+    minimum_period = max(0.9 * period_y, blob["image"].shape[1] / maximum_width)
+    maximum_period = 1.1 * period_y
+    candidate_count = max(2, int(np.ceil((maximum_period - minimum_period) * 100)) + 1)
+    candidates = np.linspace(minimum_period, maximum_period, candidate_count)
+    scored_periods = []
+    for period in candidates:
+        valid = positions + period <= positions[-1]
+        first = edge_energy[valid]
+        second = np.interp(positions[valid] + period, positions, edge_energy)
+        denominator = np.sqrt(np.dot(first, first) * np.dot(second, second))
+        score = np.dot(first, second) / denominator if denominator > 0 else 0.0
+        scored_periods.append((score, period))
+
+    edge_positions = np.flatnonzero(edge_energy > 0).astype(np.float64) + 1.0
+    edge_weights = edge_energy[edge_positions.astype(np.int64) - 1]
+    blob_offset = blob["left"] - slice_left
+    for _, period in sorted(scored_periods, reverse=True):
+        phase_count = max(1, int(np.ceil(period * 20)))
+        phases = np.linspace(0.0, period, phase_count, endpoint=False)
+        phase_scores = []
+        for phase in phases:
+            distance = np.abs((edge_positions - phase + period * 0.5) % period - period * 0.5)
+            phase_scores.append(np.dot(edge_weights, np.exp(-0.5 * np.square(distance) / 0.75 ** 2)))
+        for phase_index in np.argsort(-np.asarray(phase_scores), kind="stable"):
+            phase = phases[phase_index]
+            blob_phase = (phase - blob_offset) % period
+            if len(grid_axis(blob["image"].shape[1], period, blob_phase)[1]) - 1 <= maximum_width:
+                return float(period), float(blob_phase)
+    return float(maximum_period), 0.0
 
 
 def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
@@ -467,23 +521,23 @@ def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
 
 def collapse_blob(blob, period_x, phase_x, period_y, phase_y):
     height, width, channels = blob.shape
-    left = (period_x - phase_x) % period_x
-    top = (period_y - phase_y) % period_y
-    padded_width = left + width
-    padded_height = top + height
-    right = (-padded_width) % period_x
-    bottom = (-padded_height) % period_y
-    aligned = torch.zeros((padded_height + bottom, padded_width + right, channels), dtype=blob.dtype, device=blob.device)
+    left, column_bounds = grid_axis(width, period_x, phase_x)
+    top, row_bounds = grid_axis(height, period_y, phase_y)
+    aligned = torch.zeros((row_bounds[-1], column_bounds[-1], channels), dtype=blob.dtype, device=blob.device)
     aligned[top:top + height, left:left + width] = blob
 
-    logical_height = aligned.shape[0] // period_y
-    logical_width = aligned.shape[1] // period_x
-    cells = aligned.reshape(logical_height, period_y, logical_width, period_x, channels)
-    cells = cells.permute(0, 2, 1, 3, 4).reshape(-1, period_y * period_x, channels)
-    cell_count = cells.shape[0]
-    cell_ids = torch.arange(cell_count, device=blob.device)[:, None].expand_as(cells[..., 0]).reshape(-1)
-    center_index = (period_y // 2) * period_x + period_x // 2
-    selected = select_modal_rgba(cells.reshape(-1, channels), cell_ids, cell_count, cells[:, center_index])
+    row_lengths = torch.tensor(np.diff(row_bounds), device=blob.device)
+    column_lengths = torch.tensor(np.diff(column_bounds), device=blob.device)
+    logical_height = row_lengths.shape[0]
+    logical_width = column_lengths.shape[0]
+    row_ids = torch.repeat_interleave(torch.arange(logical_height, device=blob.device), row_lengths)
+    column_ids = torch.repeat_interleave(torch.arange(logical_width, device=blob.device), column_lengths)
+    cell_count = logical_height * logical_width
+    cell_ids = (row_ids[:, None] * logical_width + column_ids[None, :]).reshape(-1)
+    center_rows = torch.tensor(row_bounds[:-1], device=blob.device) + row_lengths // 2
+    center_columns = torch.tensor(column_bounds[:-1], device=blob.device) + column_lengths // 2
+    center_pixels = aligned[center_rows[:, None], center_columns[None, :], :].reshape(-1, channels)
+    selected = select_modal_rgba(aligned.reshape(-1, channels), cell_ids, cell_count, center_pixels)
     logical = selected.reshape(logical_height, logical_width, channels)
     visible = logical[..., 3] > 0
     if not torch.any(visible):
@@ -521,17 +575,30 @@ def trim_frame_blobs(image):
         mask = component_mask(component, image.device)
         blob = rgba[top:bottom, left:right].clone()
         blob *= mask[..., None]
-        blobs.append(blob)
+        blobs.append({"image": blob, "left": left, "right": right})
     return blobs
 
 
-def refine_frame_blobs(blobs, period_x, period_y, width, height):
+def frame_horizontal_grids(image, blobs, period_y, maximum_width):
+    if not blobs:
+        return []
+    slice_bounds = [0]
+    for first, second in zip(blobs, blobs[1:]):
+        slice_bounds.append((first["right"] + second["left"]) // 2)
+    slice_bounds.append(image.shape[1])
+    return [
+        horizontal_grid(image[:, left:right], left, blob, period_y, maximum_width)
+        for blob, left, right in zip(blobs, slice_bounds, slice_bounds[1:])
+    ]
+
+
+def refine_frame_blobs(blobs, horizontal_grids, period_y, width, height):
     output = []
-    for blob in blobs:
-        color_codes = blob_color_codes(blob)
-        phase_x = pixel_grid_phase(color_codes, period_x, width)
+    for blob, (period_x, phase_x) in zip(blobs, horizontal_grids):
+        blob_image = blob["image"]
+        color_codes = blob_color_codes(blob_image)
         phase_y = pixel_grid_phase(color_codes.transpose(0, 1), period_y, height)
-        collapsed = collapse_blob(blob, period_x, phase_x, period_y, phase_y)
+        collapsed = collapse_blob(blob_image, period_x, phase_x, period_y, phase_y)
         if collapsed is not None:
             output.append(pad_blob(collapsed, width, height))
     return output
@@ -660,8 +727,11 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         trimmed_frame_blobs = [trim_frame_blobs(frame) for frame in reduced]
         all_blobs = [blob for blobs in trimmed_frame_blobs for blob in blobs]
         if all_blobs:
-            period_x, period_y = detect_blob_periods(all_blobs, width, height)
-            frame_blobs = [refine_frame_blobs(blobs, period_x, period_y, width, height) for blobs in trimmed_frame_blobs]
+            period_y = detect_vertical_period(all_blobs, width, height)
+            horizontal_grids = [frame_horizontal_grids(frame, blobs, period_y, width)
+                                for frame, blobs in zip(reduced, trimmed_frame_blobs)]
+            frame_blobs = [refine_frame_blobs(blobs, grids, period_y, width, height)
+                           for blobs, grids in zip(trimmed_frame_blobs, horizontal_grids)]
         else:
             frame_blobs = trimmed_frame_blobs
 
