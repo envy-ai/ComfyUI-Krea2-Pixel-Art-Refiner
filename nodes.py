@@ -367,55 +367,68 @@ def component_mask(component, device):
     return torch.from_numpy(mask).to(device=device)
 
 
-def estimate_pixel_period(color_codes, maximum_logical_size):
-    color_codes = color_codes.detach().to(device="cpu").numpy()
-    size = color_codes.shape[1]
-    minimum_period = max(1, (size + maximum_logical_size - 1) // maximum_logical_size)
-    if size < 4:
-        return minimum_period, 0
+def blob_color_codes(blob):
+    rgb8 = (blob[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
+    return torch.where(blob[..., 3] > 0, color_codes, -1)
 
+
+def estimate_pixel_period(color_code_images, maximum_logical_size, minimum_allowed=1, maximum_allowed=None):
+    color_code_images = [codes.detach().to(device="cpu").numpy() for codes in color_code_images]
+    minimum_period = max(minimum_allowed, max(
+        (codes.shape[1] + maximum_logical_size - 1) // maximum_logical_size for codes in color_code_images
+    ))
+    maximum_period = max(codes.shape[1] for codes in color_code_images)
+    if maximum_allowed is not None:
+        maximum_period = min(maximum_period, maximum_allowed)
+    maximum_period = max(minimum_period, maximum_period)
     run_lengths = []
-    for row in color_codes:
-        starts = np.concatenate(([0], np.flatnonzero(row[1:] != row[:-1]) + 1))
-        ends = np.concatenate((starts[1:], [size]))
-        run_lengths.extend((ends - starts)[row[starts] >= 0].tolist())
+    for color_codes in color_code_images:
+        size = color_codes.shape[1]
+        for row in color_codes:
+            starts = np.concatenate(([0], np.flatnonzero(row[1:] != row[:-1]) + 1))
+            ends = np.concatenate((starts[1:], [size]))
+            run_lengths.extend((ends - starts)[row[starts] >= 0].tolist())
     if not run_lengths:
-        return 1, 0
+        return minimum_period
 
-    counts = np.bincount(run_lengths, minlength=size + 1)
+    counts = np.bincount(run_lengths, minlength=maximum_period + 2)
     weighted_counts = counts * np.arange(counts.shape[0])
-    maximum_period = max(minimum_period, min(size // 2, counts.shape[0] - 1))
-    period = 1
-    for candidate in range(2, maximum_period + 1):
-        previous = weighted_counts[candidate - 1]
+    period = minimum_period
+    for candidate in range(max(2, minimum_period), maximum_period + 1):
+        previous = weighted_counts[candidate - 1] if candidate > minimum_period else 0
         following = weighted_counts[candidate + 1] if candidate < maximum_period else 0
         if counts[candidate] > 1 and weighted_counts[candidate] > previous and weighted_counts[candidate] >= following:
             period = candidate
             break
-    if period == 1 and minimum_period == 1:
-        return 1, 0
-    period = max(period, minimum_period)
+    return period
 
+
+def pixel_grid_phase(color_codes, period, maximum_logical_size):
+    color_codes = color_codes.detach().to(device="cpu").numpy()
+    size = color_codes.shape[1]
     edges = (color_codes[:, 1:] != color_codes[:, :-1]).sum(axis=0)
     positions = np.flatnonzero(edges > 0) + 1
-    while period <= size:
-        residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
-        phase = int(residue_energy.argmax())
+    if positions.shape[0] == 0:
+        return 0
+    residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
+    for phase in np.argsort(-residue_energy, kind="stable").tolist():
         leading_padding = (period - phase) % period
         logical_size = (leading_padding + size + period - 1) // period
         if logical_size <= maximum_logical_size:
-            return period, phase
-        period += 1
-    return size, 0
+            return phase
+    return 0
 
 
-def blob_periods(blob, maximum_width, maximum_height):
-    rgb8 = (blob[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
-    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
-    color_codes = torch.where(blob[..., 3] > 0, color_codes, -1)
-    period_x, phase_x = estimate_pixel_period(color_codes, maximum_width)
-    period_y, phase_y = estimate_pixel_period(color_codes.transpose(0, 1), maximum_height)
-    return period_x, phase_x, period_y, phase_y
+def detect_blob_periods(blobs, maximum_width, maximum_height):
+    color_codes = [blob_color_codes(blob) for blob in blobs]
+    period_y = estimate_pixel_period([codes.transpose(0, 1) for codes in color_codes], maximum_height)
+    minimum_period_x = max((codes.shape[1] + maximum_width - 1) // maximum_width for codes in color_codes)
+    period_y = max(period_y, (10 * minimum_period_x + 10) // 11)
+    minimum_period_x = max(minimum_period_x, (9 * period_y + 9) // 10)
+    maximum_period_x = max(minimum_period_x, 11 * period_y // 10)
+    period_x = estimate_pixel_period(color_codes, maximum_width, minimum_period_x, maximum_period_x)
+    return period_x, period_y
 
 
 def select_modal_rgba(pixels, cell_ids, cell_count, center_pixels):
@@ -490,7 +503,7 @@ def pad_blob(blob, width, height):
     return output
 
 
-def extract_frame_blobs(image, width, height):
+def trim_frame_blobs(image):
     rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
     background = color_codes == color_codes[0, 0]
@@ -508,11 +521,20 @@ def extract_frame_blobs(image, width, height):
         mask = component_mask(component, image.device)
         blob = rgba[top:bottom, left:right].clone()
         blob *= mask[..., None]
-        period_x, phase_x, period_y, phase_y = blob_periods(blob, width, height)
+        blobs.append(blob)
+    return blobs
+
+
+def refine_frame_blobs(blobs, period_x, period_y, width, height):
+    output = []
+    for blob in blobs:
+        color_codes = blob_color_codes(blob)
+        phase_x = pixel_grid_phase(color_codes, period_x, width)
+        phase_y = pixel_grid_phase(color_codes.transpose(0, 1), period_y, height)
         collapsed = collapse_blob(blob, period_x, phase_x, period_y, phase_y)
         if collapsed is not None:
-            blobs.append(pad_blob(collapsed, width, height))
-    return blobs
+            output.append(pad_blob(collapsed, width, height))
+    return output
 
 
 def fit_strip_to_frame(strip, width, height):
@@ -635,7 +657,13 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
         reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
-        frame_blobs = [extract_frame_blobs(frame, width, height) for frame in reduced]
+        trimmed_frame_blobs = [trim_frame_blobs(frame) for frame in reduced]
+        all_blobs = [blob for blobs in trimmed_frame_blobs for blob in blobs]
+        if all_blobs:
+            period_x, period_y = detect_blob_periods(all_blobs, width, height)
+            frame_blobs = [refine_frame_blobs(blobs, period_x, period_y, width, height) for blobs in trimmed_frame_blobs]
+        else:
+            frame_blobs = trimmed_frame_blobs
 
         if scale_to_original:
             output = []
