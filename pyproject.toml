@@ -1,6 +1,6 @@
 [project]
 name = "krea2-pixel-art-refiner"
-version = "2.1.0"
+version = "2.1.1"
 description = "Refine Krea 2 and MiniMax H3 output with automatic or controlled pixel-grid collapse and perceptual palette reduction."
 requires-python = ">=3.10"
 dependencies = []

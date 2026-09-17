@@ -618,7 +618,7 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
                              tooltip="Maximum generated or supplied palette size."),
                 io.Boolean.Input("scale_to_original", default=True,
                                  tooltip="Scale each sprite strip to fit and pad it to the input frame dimensions."),
-                io.Boolean.Input("shared_palette", default=False,
+                io.Boolean.Input("shared_palette", default=True,
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use this image's colors as the palette for the entire batch. Overrides shared_palette."),

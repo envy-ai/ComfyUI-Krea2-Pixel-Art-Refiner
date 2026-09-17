@@ -71,7 +71,7 @@ Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It automaticall
 | `height` | 64 | Logical canvas height for each extracted blob. |
 | `colors` | 24 | Maximum generated or reduced palette size. |
 | `scale_to_original` | On | Fit each strip inside the original frame and pad it to the original dimensions. |
-| `shared_palette` | Off | Generate one palette across the input batch. |
+| `shared_palette` | On | Generate one palette across the input batch. |
 | `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
 
 With `scale_to_original` disabled, frames with fewer blobs are padded with empty white slots so every image in the output batch has the same dimensions.
