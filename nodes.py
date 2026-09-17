@@ -354,7 +354,7 @@ def visible_components(mask, minimum_area=25):
 
     return sorted(
         (component for component in components.values() if component["area"] > minimum_area),
-        key=lambda component: (component["top"], component["left"]),
+        key=lambda component: (component["left"], component["top"]),
     )
 
 
@@ -397,17 +397,6 @@ def estimate_pixel_period(color_codes, maximum_logical_size):
     period = max(period, minimum_period)
 
     edges = (color_codes[:, 1:] != color_codes[:, :-1]).sum(axis=0)
-    best_period = period
-    best_correlation = -1.0
-    for candidate in range(max(2, minimum_period, period - 1), min(maximum_period, period + 1) + 1):
-        first = edges[:-candidate]
-        second = edges[candidate:]
-        denominator = np.sqrt(np.dot(first, first) * np.dot(second, second))
-        correlation = np.dot(first, second) / denominator if denominator > 0 else 0.0
-        if correlation > best_correlation:
-            best_period = candidate
-            best_correlation = correlation
-    period = best_period
     positions = np.flatnonzero(edges > 0) + 1
     while period <= size:
         residue_energy = np.bincount(positions % period, weights=edges[positions - 1], minlength=period)
