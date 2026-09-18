@@ -488,6 +488,75 @@ def composite_white(image):
     return image[..., :3] * alpha + (1.0 - alpha)
 
 
+def split_animation_holds(images, transition_threshold):
+    rgb8 = (images[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int16)
+    differences = (rgb8[1:] - rgb8[:-1]).abs().to(torch.float32).mean(dim=(1, 2, 3))
+    boundaries = [index + 1 for index, difference in enumerate(differences.tolist()) if difference >= transition_threshold]
+    starts = [0] + boundaries
+    ends = boundaries + [images.shape[0]]
+    return [images[start:end] for start, end in zip(starts, ends)]
+
+
+def modal_rgb_composite(frames):
+    frame_count, height, width = frames.shape[:3]
+    rgb8 = (frames[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]
+    pixel_count = height * width
+    pixel_ids = torch.arange(pixel_count, device=frames.device).repeat(frame_count)
+    color_keys = (pixel_ids << 24) | color_codes.reshape(-1)
+    unique_keys, counts = torch.unique(color_keys, return_counts=True)
+    unique_pixels = unique_keys >> 24
+    unique_colors = unique_keys & 0xFFFFFF
+
+    max_counts = torch.zeros(pixel_count, dtype=counts.dtype, device=frames.device)
+    max_counts.scatter_reduce_(0, unique_pixels, counts, reduce="amax")
+    modal = counts == max_counts[unique_pixels]
+
+    red = (unique_colors >> 16) & 255
+    green = (unique_colors >> 8) & 255
+    blue = unique_colors & 255
+    luma = 2126 * red + 7152 * green + 722 * blue
+    rank = luma * 0x1000000 + unique_colors
+    sentinel = torch.iinfo(torch.int64).max
+    selected = torch.full((pixel_count,), sentinel, dtype=torch.int64, device=frames.device)
+    selected.scatter_reduce_(0, unique_pixels, torch.where(modal, rank, sentinel), reduce="amin")
+    selected &= 0xFFFFFF
+    rgb = torch.stack(((selected >> 16) & 255, (selected >> 8) & 255, selected & 255), dim=1)
+    return rgb.to(dtype=frames.dtype).reshape(height, width, 3) / 255.0
+
+
+class PixelArtAnimationPoseCompositor(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PixelArtAnimationPoseCompositor",
+            display_name="Pixel Art Animation Pose Compositor",
+            description="Separates held animation poses by frame difference and combines repeated cycles with an exact RGB mode.",
+            category="image/animation",
+            inputs=[
+                io.Image.Input("images"),
+                io.Int.Input("pose_count", default=6, min=1, max=256, step=1,
+                             tooltip="Number of distinct poses in one animation cycle."),
+                io.Float.Input("transition_threshold", default=7.0, min=0.0, max=255.0, step=0.1,
+                               tooltip="Minimum mean absolute 8-bit RGB difference between consecutive frames that starts a new held pose."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, images, pose_count, transition_threshold):
+        if images.shape[-1] < 3:
+            raise ValueError(f"Animation pose compositing requires at least 3 image channels, got {images.shape[-1]}")
+        holds = split_animation_holds(images, transition_threshold)
+        if len(holds) < pose_count or len(holds) % pose_count:
+            raise ValueError(
+                f"Detected {len(holds)} held poses; expected a positive multiple of pose_count={pose_count}. "
+                "Adjust transition_threshold or trim the input batch."
+            )
+        composites = [modal_rgb_composite(torch.cat(holds[pose::pose_count])) for pose in range(pose_count)]
+        return io.NodeOutput(torch.stack(composites))
+
+
 class MiniMaxH3PixelArtRefiner(io.ComfyNode):
     @classmethod
     def define_schema(cls):

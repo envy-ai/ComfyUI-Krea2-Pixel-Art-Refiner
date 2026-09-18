@@ -1,8 +1,8 @@
 # ComfyUI Pixel Art Refiners
 
-Three ComfyUI nodes that turn generated images and video frames into grid-aligned, limited-palette pixel art.
+Four ComfyUI nodes that refine generated pixel art and consolidate noisy held animation frames.
 
-All three nodes select perceptual palettes with weighted OKLab clustering and collapse images to a logical pixel grid. Each grid cell uses its most frequent 8-bit RGB color. Ties are resolved by choosing the color perceptually closest to the cell's center pixel in OKLab; any remaining tie uses the first matching pixel in raster order.
+The three refiner nodes select perceptual palettes with weighted OKLab clustering and collapse images to a logical pixel grid. Each grid cell uses its most frequent 8-bit RGB color. Ties are resolved by choosing the color perceptually closest to the cell's center pixel in OKLab; any remaining tie uses the first matching pixel in raster order.
 
 ## Installation
 
@@ -80,8 +80,30 @@ For image batches, the node detects the mesh from the first frame and applies th
 
 Manual resolution bypasses edge and period detection completely. For example, a `2048 × 512` four-view sheet with `16 × 16` source pixels should use `width=128` and `height=32`.
 
+## Pixel Art Animation Pose Compositor
+
+Find **Pixel Art Animation Pose Compositor** under `image/animation`. It turns a noisy video-frame batch containing repeated animation cycles into one clean image per distinct pose.
+
+The node reproduces the process used on the original 56-frame test:
+
+1. Round every input RGB channel to its 8-bit value.
+2. Measure the mean absolute RGB difference between each frame and the next over the complete image.
+3. Start a new held pose whenever that difference reaches `transition_threshold`. The default of `7.0` separated the test's within-pose differences (`0.044–1.978`) from its real transitions (`13.182–29.786`).
+4. Assign detected holds to poses in cycle order. With six poses, holds 1, 7, 13, and so on belong to pose 1; holds 2, 8, 14, and so on belong to pose 2.
+5. At every pixel in each pose, select the exact RGB value occurring most often across all frames in its matching holds.
+6. If multiple RGB values have the same maximum count, choose the one with the lowest Rec.709 luma. If luma is also tied, choose the lowest packed RGB value for deterministic output.
+
+| Input | Default | Description |
+| --- | ---: | --- |
+| `images` | — | Ordered animation frames at a common resolution. |
+| `pose_count` | 6 | Number of distinct poses in one complete animation cycle. |
+| `transition_threshold` | 7.0 | Minimum full-frame mean absolute RGB difference, measured in 8-bit levels, that begins a new held pose. |
+
+The number of detected holds must be a positive multiple of `pose_count`. A mismatch produces an error instead of silently combining unrelated poses; adjust the threshold or trim the batch when that happens. The output is an IMAGE batch of `pose_count` composited frames in animation order.
+
 Typical wiring:
 
 ```text
 VAE Decode → Pixel Art Refiner → Save Image or Create Video
+VAE Decode → Pixel Art Refiner → Animation Pose Compositor → Create Video
 ```
