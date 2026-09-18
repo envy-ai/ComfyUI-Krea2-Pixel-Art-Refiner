@@ -576,8 +576,6 @@ def detect_animation_pose_count(holds):
     distances = distances.tolist()
 
     for pose_count in range(2, len(holds) // 2 + 1):
-        if len(holds) % pose_count:
-            continue
         matches = True
         for index in range(pose_count, len(holds)):
             phase = index % pose_count
@@ -646,9 +644,9 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
         holds = split_animation_holds(images, transition_threshold)
         if pose_count == 0:
             pose_count = detect_animation_pose_count(holds)
-        if len(holds) < pose_count or len(holds) % pose_count:
+        if len(holds) < pose_count:
             raise ValueError(
-                f"Detected {len(holds)} held poses; expected a positive multiple of pose_count={pose_count}. "
+                f"Detected {len(holds)} held poses, fewer than pose_count={pose_count}. "
                 "Adjust transition_threshold or trim the input batch."
             )
         composites = [modal_rgb_composite(torch.cat(holds[pose::pose_count])) for pose in range(pose_count)]
