@@ -349,21 +349,14 @@ def estimate_mesh_pixel_width(mesh):
     return max(1, int(np.round(np.median(middle if len(middle) else gaps))))
 
 
-def homogenize_mesh_lines(lines, pixel_width):
-    completed = []
-    for start, end in zip(lines, lines[1:]):
-        cell_count = int(np.round((end - start) / pixel_width))
-        if cell_count > 0:
-            cell_width = (end - start) / cell_count
-            completed.extend(start + int(index * cell_width) for index in range(cell_count))
-    completed.append(lines[-1])
-    return completed
-
-
 def mesh_from_edges(edges):
     initial = detect_mesh_lines(edges)
+    if len(initial[0]) in (2, 3) and len(initial[1]) in (2, 3):
+        return initial
     pixel_width = estimate_mesh_pixel_width(initial)
-    return tuple(homogenize_mesh_lines(lines, pixel_width) for lines in initial)
+    logical_width = max(1, round(edges.shape[1] / pixel_width))
+    logical_height = max(1, round(edges.shape[0] / pixel_width))
+    return regular_mesh(edges.shape[1], edges.shape[0], logical_width, logical_height)
 
 
 def usable_mesh(mesh):
@@ -538,20 +531,22 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3PixelArtAutorefiner",
             display_name="MiniMax H3 Pixel Art Autorefiner",
-            description="Detects one pixel mesh across the full frame and collapses it without splitting sprites.",
+            description="Detects or applies one even pixel mesh across the full frame without splitting sprites.",
             category="image/minimax",
             inputs=[
                 io.Image.Input("image"),
                 io.Int.Input("width", default=64, min=1, max=16384, step=1,
-                             tooltip="Fallback logical width used when automatic mesh detection cannot find a grid."),
+                             tooltip="Full-frame logical width for manual mode or automatic detection fallback."),
                 io.Int.Input("height", default=64, min=1, max=16384, step=1,
-                             tooltip="Fallback logical height used when automatic mesh detection cannot find a grid."),
+                             tooltip="Full-frame logical height for manual mode or automatic detection fallback."),
                 io.Int.Input("colors", default=24, min=2, max=256, step=1,
                              tooltip="Maximum generated or supplied palette size."),
                 io.Boolean.Input("scale_to_original", default=True,
                                  tooltip="Scale and pad the collapsed frame to the input dimensions."),
                 io.Boolean.Input("shared_palette", default=True,
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
+                io.Boolean.Input("manual_resolution", default=False,
+                                 tooltip="Divide the full frame evenly into width × height cells instead of detecting a mesh."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use this image's colors as the palette for the entire batch. Overrides shared_palette."),
             ],
@@ -559,7 +554,8 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image, width, height, colors, scale_to_original, shared_palette=False, palette_image=None):
+    def execute(cls, image, width, height, colors, scale_to_original, shared_palette=False, palette_image=None,
+                manual_resolution=False):
         if image.shape[-1] < 3:
             raise ValueError(f"MiniMax H3 pixel art autorefiner requires at least 3 image channels, got {image.shape[-1]}")
         if palette_image is not None and palette_image.shape[-1] < 3:
@@ -570,7 +566,11 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
-        mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
+        if manual_resolution:
+            mesh = regular_mesh(image.shape[2], image.shape[1], width, height)
+            mesh_scale = 1
+        else:
+            mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
         reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
         collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
 

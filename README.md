@@ -58,8 +58,8 @@ When a palette image contains no more than `colors` unique RGB values, those exa
 Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It detects and collapses one pixel mesh across each complete frame:
 
 1. Reduce the frame to the requested perceptual palette.
-2. Upscale the source two times and detect edges with Canny and morphological closing.
-3. Find horizontal and vertical grid lines with a probabilistic Hough transform, cluster nearby lines, estimate the pixel size from the median filtered gaps, and complete the mesh.
+2. Unless manual resolution is enabled, upscale the source two times and detect edges with Canny and morphological closing.
+3. Find horizontal and vertical grid lines with a probabilistic Hough transform, cluster nearby lines, estimate the pixel size from the median filtered gaps, and build an even full-frame mesh from that spacing.
 4. Collapse each mesh cell with the same modal-color and center-pixel tie breaking used by the other refiners.
 5. Treat the upper-left color as transparent, optionally scale and pad the complete collapsed frame to the original dimensions, then composite it on white.
 
@@ -68,14 +68,17 @@ The mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJ
 | Input | Default | Description |
 | --- | ---: | --- |
 | `image` | — | ComfyUI image, video-frame batch, or image batch. |
-| `width` | 64 | Fallback logical width if automatic mesh detection fails. |
-| `height` | 64 | Fallback logical height if automatic mesh detection fails. |
+| `width` | 64 | Full-frame logical width in manual mode, or fallback width if detection fails. |
+| `height` | 64 | Full-frame logical height in manual mode, or fallback height if detection fails. |
 | `colors` | 24 | Maximum generated or reduced palette size. |
 | `scale_to_original` | On | Fit the collapsed frame inside the original frame and pad it to the original dimensions. |
 | `shared_palette` | On | Generate one palette across the input batch. |
+| `manual_resolution` | Off | Divide the full frame evenly into `width × height` cells instead of detecting a mesh. |
 | `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
 
 For image batches, the node detects the mesh from the first frame and applies that exact mesh to every later frame. This keeps sprite size and position stable across an animation without combining edge evidence from different frames. With `scale_to_original` disabled, the node returns the detected true pixel resolution.
+
+Manual resolution bypasses edge and period detection completely. For example, a `2048 × 512` four-view sheet with `16 × 16` source pixels should use `width=128` and `height=32`.
 
 Typical wiring:
 
