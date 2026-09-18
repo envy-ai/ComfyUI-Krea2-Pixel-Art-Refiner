@@ -779,7 +779,7 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3PixelArtAutorefiner",
             display_name="MiniMax H3 Pixel Art Autorefiner",
-            description="Detects or applies one pixel mesh across the full frame without splitting sprites.",
+            description="Detects a pixel mesh across the full frame or independently within fixed horizontal direction regions.",
             category="image/minimax",
             inputs=[
                 io.Image.Input("image"),
@@ -795,6 +795,8 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
                 io.Boolean.Input("manual_resolution", default=False,
                                  tooltip="Divide the full frame evenly into width × height cells instead of detecting a mesh."),
+                io.Int.Input("direction_count", default=1, min=1, max=64, step=1,
+                             tooltip="Detect an independent grid in each fixed horizontal region. Use 4 for a four-direction sprite sheet; 1 keeps whole-frame detection."),
                 io.Boolean.Input("align_palette_lightness", default=True,
                                  tooltip="Compensate for a shared OKLab lightness shift before matching a supplied palette."),
                 io.Boolean.Input("preserve_generated_background", default=True,
@@ -807,29 +809,56 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, width, height, colors, scale_to_original, shared_palette=False, palette_image=None,
-                manual_resolution=False, align_palette_lightness=True, preserve_generated_background=True):
+                manual_resolution=False, direction_count=1, align_palette_lightness=True,
+                preserve_generated_background=True):
         if image.shape[-1] < 3:
             raise ValueError(f"MiniMax H3 pixel art autorefiner requires at least 3 image channels, got {image.shape[-1]}")
         if palette_image is not None and palette_image.shape[-1] < 3:
             raise ValueError(f"Palette image requires at least 3 image channels, got {palette_image.shape[-1]}")
         if width > image.shape[2] or height > image.shape[1]:
             raise ValueError(f"Fallback grid {width}x{height} cannot exceed image size {image.shape[2]}x{image.shape[1]}")
+        if not manual_resolution and (direction_count > image.shape[2] or direction_count > width):
+            raise ValueError(f"direction_count={direction_count} cannot exceed image width {image.shape[2]} or fallback width {width}")
 
         fixed_palette = None
         if palette_image is not None:
             fixed_palette = fixed_palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device,
                                                      preserve_generated_background)
-        if manual_resolution:
-            mesh = regular_mesh(image.shape[2], image.shape[1], width, height)
-            mesh_scale = 1
+        if manual_resolution or direction_count == 1:
+            if manual_resolution:
+                mesh = regular_mesh(image.shape[2], image.shape[1], width, height)
+                mesh_scale = 1
+            else:
+                mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
+            meshes = [(0, image.shape[2], mesh, mesh_scale)]
         else:
-            mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
-        reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette, align_palette_lightness)
-        collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
+            region_bounds = [round(index * image.shape[2] / direction_count) for index in range(direction_count + 1)]
+            fallback_bounds = [round(index * width / direction_count) for index in range(direction_count + 1)]
+            meshes = []
+            for index, (left, right) in enumerate(zip(region_bounds, region_bounds[1:])):
+                fallback_width = fallback_bounds[index + 1] - fallback_bounds[index]
+                mesh, mesh_scale = detect_pixel_mesh(image[0, :, left:right], fallback_width, height)
+                meshes.append((left, right, mesh, mesh_scale))
 
-        if scale_to_original:
-            output = [fit_frame_to_size(frame, image.shape[2], image.shape[1]) for frame in collapsed]
-            return io.NodeOutput(composite_white(torch.stack(output)))
+        reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette, align_palette_lightness)
+        collapsed = []
+        for frame in reduced:
+            regions = [collapse_frame_mesh(frame[:, left:right], mesh, mesh_scale)
+                       for left, right, mesh, mesh_scale in meshes]
+            if scale_to_original:
+                regions = [fit_frame_to_size(region, right - left, image.shape[1])
+                           for region, (left, right, _, _) in zip(regions, meshes)]
+            else:
+                output_height = max(region.shape[0] for region in regions)
+                padded = []
+                for region in regions:
+                    output = torch.zeros((output_height, region.shape[1], 4), dtype=region.dtype, device=region.device)
+                    top = (output_height - region.shape[0]) // 2
+                    output[top:top + region.shape[0]] = region
+                    padded.append(output)
+                regions = padded
+            collapsed.append(torch.cat(regions, dim=1))
+
         return io.NodeOutput(composite_white(torch.stack(collapsed)))
 
 
