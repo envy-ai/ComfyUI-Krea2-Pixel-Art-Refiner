@@ -419,6 +419,9 @@ def estimate_mesh_pixel_width(mesh, minimum_pixel_width):
         multiples = np.maximum(1, np.round(gaps / candidate))
         residuals = np.abs(gaps - multiples * candidate)
         scores.append((np.median(residuals), np.mean(np.minimum(residuals, candidate * 0.25)), candidate))
+    hint_score = scores[0]
+    if hint_score[0] <= minimum_pixel_width * 0.2 and hint_score[1] <= minimum_pixel_width * 0.2:
+        return minimum_pixel_width
     return min(scores)[2]
 
 
