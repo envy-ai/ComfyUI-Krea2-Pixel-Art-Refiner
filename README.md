@@ -61,7 +61,7 @@ Find **MiniMax H3 Pixel Art Autorefiner** under `image/minimax`. It detects and 
 
 1. Reduce the frame to the requested perceptual palette.
 2. Unless manual resolution is enabled, divide the frame into `direction_count` equal horizontal regions, upscale each region two times, and detect edges with Canny and morphological closing.
-3. Find horizontal and vertical grid lines with a probabilistic Hough transform, cluster nearby lines, and estimate the pixel size from the median filtered gaps. Weak landmarks spaced about half a pixel from stronger surrounding lines are discarded, then gaps are subdivided locally so variations in pixel pitch are retained.
+3. Find horizontal and vertical grid lines with a probabilistic Hough transform and cluster nearby lines. Estimate the fundamental pixel size that makes the observed gaps integer multiples, so missing grid landmarks do not turn two or three pixels into one oversized cell. Short false cells are merged with the neighboring interval that best fits the detected period, then the remaining gaps are subdivided locally so variations in pixel pitch are retained. The fallback resolution sets the smallest allowed pitch and maximum detected grid size.
 4. Collapse each mesh cell with the same modal-color and center-pixel tie breaking used by the other refiners.
 5. Treat the upper-left color as transparent, optionally scale and pad the complete collapsed frame to the original dimensions, then composite it on white.
 

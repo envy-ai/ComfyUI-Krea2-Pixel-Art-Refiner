@@ -402,12 +402,24 @@ def detect_mesh_lines(edges):
     return cluster_mesh_lines(lines_x), cluster_mesh_lines(lines_y)
 
 
-def estimate_mesh_pixel_width(mesh):
-    gaps = np.concatenate([np.diff(lines) for lines in mesh])
-    low = np.percentile(gaps, 20)
-    high = np.percentile(gaps, 80)
-    middle = gaps[(gaps >= low) & (gaps <= high)]
-    return max(1, int(np.round(np.median(middle if len(middle) else gaps))))
+def estimate_mesh_pixel_width(mesh, minimum_pixel_width):
+    gap_sets = [np.diff(lines)[1:-1] for lines in mesh if len(lines) > 3]
+    if not gap_sets:
+        return minimum_pixel_width
+    gaps = np.concatenate(gap_sets)
+    gaps = gaps[gaps >= minimum_pixel_width * 0.75]
+    if not len(gaps):
+        return minimum_pixel_width
+
+    maximum_pixel_width = max(minimum_pixel_width, np.percentile(gaps, 80))
+    candidate_count = min(4096, max(2, int(np.ceil((maximum_pixel_width - minimum_pixel_width) * 20)) + 1))
+    candidates = np.linspace(minimum_pixel_width, maximum_pixel_width, candidate_count)
+    scores = []
+    for candidate in candidates:
+        multiples = np.maximum(1, np.round(gaps / candidate))
+        residuals = np.abs(gaps - multiples * candidate)
+        scores.append((np.median(residuals), np.mean(np.minimum(residuals, candidate * 0.25)), candidate))
+    return min(scores)[2]
 
 
 def filter_weak_mesh_lines(lines, edges, pixel_width):
@@ -427,6 +439,32 @@ def filter_weak_mesh_lines(lines, edges, pixel_width):
     return lines
 
 
+def filter_short_mesh_cells(lines, edges, pixel_width):
+    lines = list(lines)
+    radius = max(1, round(pixel_width * 0.2))
+    while len(lines) > 2:
+        gaps = np.diff(lines)
+        short = np.flatnonzero(gaps < pixel_width * 0.8)
+        if not len(short):
+            break
+        index = int(short[0])
+        choices = []
+        if index > 0:
+            merged = lines[index + 1] - lines[index - 1]
+            residual = abs(merged - max(1, round(merged / pixel_width)) * pixel_width)
+            support = np.count_nonzero(edges[:, max(0, lines[index] - radius):lines[index] + radius + 1])
+            choices.append((residual, support, index))
+        if index + 1 < len(lines) - 1:
+            merged = lines[index + 2] - lines[index]
+            residual = abs(merged - max(1, round(merged / pixel_width)) * pixel_width)
+            support = np.count_nonzero(edges[:, max(0, lines[index + 1] - radius):lines[index + 1] + radius + 1])
+            choices.append((residual, support, index + 1))
+        if not choices:
+            break
+        del lines[min(choices)[2]]
+    return lines
+
+
 def homogenize_mesh_lines(lines, pixel_width):
     completed = []
     for start, end in zip(lines, lines[1:]):
@@ -437,19 +475,38 @@ def homogenize_mesh_lines(lines, pixel_width):
     return completed
 
 
-def mesh_from_edges(edges):
+def mesh_from_edges(edges, minimum_pixel_width, maximum_width, maximum_height):
     initial = detect_mesh_lines(edges)
     if len(initial[0]) in (2, 3) and len(initial[1]) in (2, 3):
         return initial
-    pixel_width = estimate_mesh_pixel_width(initial)
+    pixel_width = estimate_mesh_pixel_width(initial, minimum_pixel_width)
     lines_x = filter_weak_mesh_lines(initial[0], edges, pixel_width)
     lines_y = filter_weak_mesh_lines(initial[1], edges.T, pixel_width)
+    lines_x = filter_short_mesh_cells(lines_x, edges, pixel_width)
+    lines_y = filter_short_mesh_cells(lines_y, edges.T, pixel_width)
+
+    def exceeds_target(candidate):
+        cells_x = sum(max(1, round(gap / candidate)) for gap in np.diff(lines_x))
+        cells_y = sum(max(1, round(gap / candidate)) for gap in np.diff(lines_y))
+        return cells_x > maximum_width or cells_y > maximum_height
+
+    if exceeds_target(pixel_width):
+        lower = pixel_width
+        upper = max(edges.shape)
+        for _ in range(24):
+            middle = (lower + upper) / 2
+            if exceeds_target(middle):
+                lower = middle
+            else:
+                upper = middle
+        pixel_width = upper
     return homogenize_mesh_lines(lines_x, pixel_width), homogenize_mesh_lines(lines_y, pixel_width)
 
 
-def usable_mesh(mesh):
+def usable_mesh(mesh, maximum_width, maximum_height):
     lines_x, lines_y = mesh
-    return len(lines_x) >= 2 and len(lines_y) >= 2 and not (len(lines_x) in (2, 3) and len(lines_y) in (2, 3))
+    return (2 <= len(lines_x) <= maximum_width + 1 and 2 <= len(lines_y) <= maximum_height + 1
+            and not (len(lines_x) in (2, 3) and len(lines_y) in (2, 3)))
 
 
 def regular_mesh(image_width, image_height, logical_width, logical_height):
@@ -459,11 +516,12 @@ def regular_mesh(image_width, image_height, logical_width, logical_height):
 
 
 def detect_pixel_mesh(frame, fallback_width, fallback_height):
-    mesh = mesh_from_edges(frame_edge_map(frame, 2))
-    if usable_mesh(mesh):
+    minimum_pixel_width = min(frame.shape[1] / fallback_width, frame.shape[0] / fallback_height)
+    mesh = mesh_from_edges(frame_edge_map(frame, 2), minimum_pixel_width * 2, fallback_width, fallback_height)
+    if usable_mesh(mesh, fallback_width, fallback_height):
         return mesh, 2
-    mesh = mesh_from_edges(frame_edge_map(frame, 1))
-    if usable_mesh(mesh):
+    mesh = mesh_from_edges(frame_edge_map(frame, 1), minimum_pixel_width, fallback_width, fallback_height)
+    if usable_mesh(mesh, fallback_width, fallback_height):
         return mesh, 1
     return regular_mesh(frame.shape[1], frame.shape[0], fallback_width, fallback_height), 1
 
