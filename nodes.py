@@ -741,13 +741,31 @@ def modal_rgb_composite(frames):
     return rgb.to(dtype=frames.dtype).reshape(height, width, 3) / 255.0
 
 
+def remove_connected_background_halo(image, threshold=0.1):
+    background = image[0, 0]
+    near_background = (image - background).square().mean(dim=-1) < threshold * threshold
+    connected = torch.zeros_like(near_background)
+    connected[0] = near_background[0]
+    connected[-1] = near_background[-1]
+    connected[:, 0] = near_background[:, 0]
+    connected[:, -1] = near_background[:, -1]
+    while True:
+        expanded = torch.nn.functional.max_pool2d(
+            connected.to(dtype=image.dtype)[None, None], 3, stride=1, padding=1
+        )[0, 0].bool() & near_background
+        if torch.equal(expanded, connected):
+            break
+        connected = expanded
+    return torch.where(connected[..., None], background, image)
+
+
 class PixelArtAnimationPoseCompositor(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
             node_id="PixelArtAnimationPoseCompositor",
             display_name="Pixel Art Animation Pose Compositor",
-            description="Separates held animation poses by frame difference and combines repeated cycles with an exact RGB mode.",
+            description="Separates held animation poses, combines repeated cycles with an exact RGB mode, and removes connected near-background halos.",
             category="image/animation",
             inputs=[
                 io.Image.Input("images"),
@@ -776,7 +794,8 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
                 f"Detected {len(holds)} held poses, fewer than pose_count={pose_count}. "
                 "Adjust transition_threshold or trim the input batch."
             )
-        composites = [modal_rgb_composite(torch.cat(holds[pose::pose_count])) for pose in range(pose_count)]
+        composites = [remove_connected_background_halo(modal_rgb_composite(torch.cat(holds[pose::pose_count])))
+                      for pose in range(pose_count)]
         return io.NodeOutput(torch.stack(composites))
 
 

@@ -99,6 +99,7 @@ The node reproduces the process used on the original 56-frame test:
 6. Assign detected holds to poses in cycle order. With six poses, holds 1, 7, 13, and so on belong to pose 1; holds 2, 8, 14, and so on belong to pose 2.
 7. At every pixel in each pose, select the exact RGB value occurring most often across all frames in its matching holds.
 8. If multiple RGB values have the same maximum count, choose the one with the lowest Rec.709 luma. If luma is also tied, choose the lowest packed RGB value for deterministic output.
+9. Starting from all image borders, flood through pixels whose RMS RGB distance from the upper-left background color is less than 10%, and replace that connected region with the exact background color. Enclosed near-background pixels are preserved.
 
 | Input | Default | Description |
 | --- | ---: | --- |
