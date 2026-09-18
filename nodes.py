@@ -497,6 +497,41 @@ def split_animation_holds(images, transition_threshold):
     return [images[start:end] for start, end in zip(starts, ends)]
 
 
+def animation_hold_representative(hold):
+    frames = (hold[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.float32).reshape(hold.shape[0], -1)
+    scores = torch.zeros(hold.shape[0], device=hold.device)
+    for frame in frames:
+        scores += (frames - frame).abs().mean(dim=1)
+    return frames[scores.argmin()]
+
+
+def detect_animation_pose_count(holds):
+    if len(holds) == 1:
+        return 1
+    representatives = torch.stack([animation_hold_representative(hold) for hold in holds])
+    distances = torch.empty((len(holds), len(holds)), device=representatives.device)
+    for index, representative in enumerate(representatives):
+        distances[index] = (representatives - representative).abs().mean(dim=1)
+    distances = distances.tolist()
+
+    for pose_count in range(2, len(holds) // 2 + 1):
+        if len(holds) % pose_count:
+            continue
+        matches = True
+        for index in range(pose_count, len(holds)):
+            phase = index % pose_count
+            wrong_distance = min(distances[index][candidate] for candidate in range(pose_count) if candidate != phase)
+            if distances[index][phase] * 2 >= wrong_distance:
+                matches = False
+                break
+        if matches:
+            return pose_count
+    raise ValueError(
+        f"Could not find a repeated cycle among {len(holds)} held poses. "
+        "Set pose_count explicitly, adjust transition_threshold, or provide at least two complete cycles."
+    )
+
+
 def modal_rgb_composite(frames):
     frame_count, height, width = frames.shape[:3]
     rgb8 = (frames[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
@@ -535,8 +570,8 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
             category="image/animation",
             inputs=[
                 io.Image.Input("images"),
-                io.Int.Input("pose_count", default=6, min=1, max=256, step=1,
-                             tooltip="Number of distinct poses in one animation cycle."),
+                io.Int.Input("pose_count", default=6, min=0, max=256, step=1,
+                             tooltip="Number of distinct poses in one animation cycle. Set to 0 to autodetect from repeated cycles."),
                 io.Float.Input("transition_threshold", default=7.0, min=0.0, max=255.0, step=0.1,
                                tooltip="Minimum mean absolute 8-bit RGB difference between consecutive frames that starts a new held pose."),
             ],
@@ -548,6 +583,8 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
         if images.shape[-1] < 3:
             raise ValueError(f"Animation pose compositing requires at least 3 image channels, got {images.shape[-1]}")
         holds = split_animation_holds(images, transition_threshold)
+        if pose_count == 0:
+            pose_count = detect_animation_pose_count(holds)
         if len(holds) < pose_count or len(holds) % pose_count:
             raise ValueError(
                 f"Detected {len(holds)} held poses; expected a positive multiple of pose_count={pose_count}. "

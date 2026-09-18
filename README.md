@@ -96,10 +96,12 @@ The node reproduces the process used on the original 56-frame test:
 | Input | Default | Description |
 | --- | ---: | --- |
 | `images` | — | Ordered animation frames at a common resolution. |
-| `pose_count` | 6 | Number of distinct poses in one complete animation cycle. |
+| `pose_count` | 6 | Number of distinct poses in one complete animation cycle. Set to `0` to autodetect it from repeated cycles. |
 | `transition_threshold` | 7.0 | Minimum full-frame mean absolute RGB difference, measured in 8-bit levels, that begins a new held pose. |
 
-The number of detected holds must be a positive multiple of `pose_count`. A mismatch produces an error instead of silently combining unrelated poses; adjust the threshold or trim the batch when that happens. The output is an IMAGE batch of `pose_count` composited frames in animation order.
+With `pose_count=0`, the node selects one medoid frame from every hold and tests possible cycle lengths. It accepts the shortest period where every hold in later cycles is at least twice as close to its corresponding first-cycle pose as it is to any other first-cycle pose. Autodetection therefore requires at least two complete cycles. If no unambiguous period is found, the node asks for an explicit pose count instead of combining unrelated poses.
+
+The number of detected holds must be a positive multiple of the selected pose count. A mismatch produces an error instead of silently combining unrelated poses; adjust the threshold or trim the batch when that happens. The output is an IMAGE batch of composited frames in animation order.
 
 Typical wiring:
 
