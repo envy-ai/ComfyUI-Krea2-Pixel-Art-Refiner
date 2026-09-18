@@ -349,14 +349,41 @@ def estimate_mesh_pixel_width(mesh):
     return max(1, int(np.round(np.median(middle if len(middle) else gaps))))
 
 
+def filter_weak_mesh_lines(lines, edges, pixel_width):
+    lines = list(lines)
+    radius = max(1, round(pixel_width * 0.2))
+    while len(lines) > 2:
+        support = [np.count_nonzero(edges[:, max(0, position - radius):position + radius + 1]) for position in lines]
+        remove = []
+        for index in range(1, len(lines) - 1):
+            close = min(lines[index] - lines[index - 1], lines[index + 1] - lines[index]) < pixel_width * 0.75
+            surrounding_support = (support[index - 1] + support[index + 1]) / 2
+            if close and support[index] < surrounding_support * 0.7:
+                remove.append(index)
+        if not remove:
+            break
+        lines = [position for index, position in enumerate(lines) if index not in remove]
+    return lines
+
+
+def homogenize_mesh_lines(lines, pixel_width):
+    completed = []
+    for start, end in zip(lines, lines[1:]):
+        cell_count = max(1, int(np.round((end - start) / pixel_width)))
+        cell_width = (end - start) / cell_count
+        completed.extend(start + int(index * cell_width) for index in range(cell_count))
+    completed.append(lines[-1])
+    return completed
+
+
 def mesh_from_edges(edges):
     initial = detect_mesh_lines(edges)
     if len(initial[0]) in (2, 3) and len(initial[1]) in (2, 3):
         return initial
     pixel_width = estimate_mesh_pixel_width(initial)
-    logical_width = max(1, round(edges.shape[1] / pixel_width))
-    logical_height = max(1, round(edges.shape[0] / pixel_width))
-    return regular_mesh(edges.shape[1], edges.shape[0], logical_width, logical_height)
+    lines_x = filter_weak_mesh_lines(initial[0], edges, pixel_width)
+    lines_y = filter_weak_mesh_lines(initial[1], edges.T, pixel_width)
+    return homogenize_mesh_lines(lines_x, pixel_width), homogenize_mesh_lines(lines_y, pixel_width)
 
 
 def usable_mesh(mesh):
@@ -531,7 +558,7 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
         return io.Schema(
             node_id="MiniMaxH3PixelArtAutorefiner",
             display_name="MiniMax H3 Pixel Art Autorefiner",
-            description="Detects or applies one even pixel mesh across the full frame without splitting sprites.",
+            description="Detects or applies one pixel mesh across the full frame without splitting sprites.",
             category="image/minimax",
             inputs=[
                 io.Image.Input("image"),
