@@ -566,7 +566,7 @@ def animation_hold_representative(hold):
     return frames[scores.argmin()]
 
 
-def trim_animation_hold_edges(hold):
+def filter_animation_hold_outliers(hold, include_edges, include_interior):
     while hold.shape[0] > 2:
         representative = animation_hold_representative(hold)
         frames = (hold[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.float32).reshape(hold.shape[0], -1)
@@ -574,12 +574,20 @@ def trim_animation_hold_edges(hold):
         median = distances.median()
         deviation = (distances - median).abs().median()
         limit = median + torch.maximum(3 * deviation, torch.ones((), device=hold.device))
-        trim_start = distances[0].item() > limit.item()
-        trim_end = distances[-1].item() > limit.item()
-        if not trim_start and not trim_end:
+        remove = distances > limit
+        if not include_interior:
+            remove[1:-1] = False
+        if not include_edges:
+            remove[0] = False
+            remove[-1] = False
+        if not remove.any().item():
             break
-        hold = hold[int(trim_start):hold.shape[0] - int(trim_end)]
+        hold = hold[~remove]
     return hold
+
+
+def trim_animation_hold_edges(hold):
+    return filter_animation_hold_outliers(hold, True, False)
 
 
 def detect_animation_pose_count(holds):
@@ -651,17 +659,19 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
                                tooltip="Minimum mean absolute 8-bit RGB difference between consecutive frames that starts a new held pose."),
                 io.Boolean.Input("trim_outlier_edges", default=True,
                                  tooltip="Remove leading and trailing frames that are robust RGB-distance outliers within their held pose."),
+                io.Boolean.Input("remove_interior_outliers", default=True,
+                                 tooltip="Remove interior frames that are robust RGB-distance outliers within their held pose."),
             ],
             outputs=[io.Image.Output()],
         )
 
     @classmethod
-    def execute(cls, images, pose_count, transition_threshold, trim_outlier_edges=True):
+    def execute(cls, images, pose_count, transition_threshold, trim_outlier_edges=True, remove_interior_outliers=True):
         if images.shape[-1] < 3:
             raise ValueError(f"Animation pose compositing requires at least 3 image channels, got {images.shape[-1]}")
         holds = split_animation_holds(images, transition_threshold)
-        if trim_outlier_edges:
-            holds = [trim_animation_hold_edges(hold) for hold in holds]
+        if trim_outlier_edges or remove_interior_outliers:
+            holds = [filter_animation_hold_outliers(hold, trim_outlier_edges, remove_interior_outliers) for hold in holds]
         if pose_count == 0:
             pose_count = detect_animation_pose_count(holds)
         if len(holds) < pose_count:

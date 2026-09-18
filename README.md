@@ -93,7 +93,7 @@ The node reproduces the process used on the original 56-frame test:
 1. Round every input RGB channel to its 8-bit value.
 2. Measure the mean absolute RGB difference between each frame and the next over the complete image.
 3. Start a new held pose whenever that difference reaches `transition_threshold`. The default of `7.0` separated the test's within-pose differences (`0.044–1.978`) from its real transitions (`13.182–29.786`).
-4. Optionally remove leading and trailing frames whose RGB distance from the hold's medoid exceeds the hold median by the larger of three median absolute deviations or one 8-bit RGB level. The limit is recalculated after each trim; interior frames are never removed and every hold retains at least one frame.
+4. Optionally remove boundary and interior frames whose RGB distance from the hold's medoid exceeds the hold median by the larger of three median absolute deviations or one 8-bit RGB level. The limit is recalculated after each pass and every hold retains at least one frame.
 5. Assign detected holds to poses in cycle order. With six poses, holds 1, 7, 13, and so on belong to pose 1; holds 2, 8, 14, and so on belong to pose 2.
 6. At every pixel in each pose, select the exact RGB value occurring most often across all frames in its matching holds.
 7. If multiple RGB values have the same maximum count, choose the one with the lowest Rec.709 luma. If luma is also tied, choose the lowest packed RGB value for deterministic output.
@@ -104,6 +104,7 @@ The node reproduces the process used on the original 56-frame test:
 | `pose_count` | 0 | Autodetect the number of distinct poses from repeated cycles. Set a positive value to specify it explicitly. |
 | `transition_threshold` | 7.0 | Minimum full-frame mean absolute RGB difference, measured in 8-bit levels, that begins a new held pose. |
 | `trim_outlier_edges` | On | Remove anomalous leading and trailing frames from each hold before cycle detection and compositing. |
+| `remove_interior_outliers` | On | Remove anomalous interior frames from each hold before cycle detection and compositing. |
 
 With `pose_count=0`, the node selects one medoid frame from every hold and tests possible cycle lengths. It accepts the shortest period where every hold in later cycles is at least twice as close to its corresponding first-cycle pose as it is to any other first-cycle pose. Autodetection therefore requires at least two complete cycles. Any trailing partial cycle is checked against the same phase order; for example, a thirteenth hold after two six-pose cycles is grouped with pose 1. If no unambiguous period is found, the node asks for an explicit pose count instead of combining unrelated poses.
 
