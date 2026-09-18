@@ -103,8 +103,7 @@ The node reproduces the process used on the original 56-frame test:
 | `images` | — | Ordered animation frames at a common resolution. |
 | `pose_count` | 0 | Autodetect the number of distinct poses from repeated cycles. Set a positive value to specify it explicitly. |
 | `transition_threshold` | 7.0 | Minimum full-frame mean absolute RGB difference, measured in 8-bit levels, that begins a new held pose. |
-| `trim_outlier_edges` | On | Remove anomalous leading and trailing frames from each hold before cycle detection and compositing. |
-| `remove_interior_outliers` | On | Remove anomalous interior frames from each hold before cycle detection and compositing. |
+| `remove_outliers` | On | Remove anomalous frames from each hold before cycle detection and compositing. |
 
 With `pose_count=0`, the node selects one medoid frame from every hold and tests possible cycle lengths. It accepts the shortest period where every hold in later cycles is at least twice as close to its corresponding first-cycle pose as it is to any other first-cycle pose. Autodetection therefore requires at least two complete cycles. Any trailing partial cycle is checked against the same phase order; for example, a thirteenth hold after two six-pose cycles is grouped with pose 1. If no unambiguous period is found, the node asks for an explicit pose count instead of combining unrelated poses.
 
