@@ -570,7 +570,7 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
             category="image/animation",
             inputs=[
                 io.Image.Input("images"),
-                io.Int.Input("pose_count", default=6, min=0, max=256, step=1,
+                io.Int.Input("pose_count", default=0, min=0, max=256, step=1,
                              tooltip="Number of distinct poses in one animation cycle. Set to 0 to autodetect from repeated cycles."),
                 io.Float.Input("transition_threshold", default=7.0, min=0.0, max=255.0, step=0.1,
                                tooltip="Minimum mean absolute 8-bit RGB difference between consecutive frames that starts a new held pose."),
