@@ -581,29 +581,59 @@ def filter_animation_hold_outliers(hold):
     return hold
 
 
-def detect_animation_pose_count(holds):
+def merge_interrupted_animation_holds(holds):
+    holds = list(holds)
+    while len(holds) >= 3:
+        representatives = torch.stack([animation_hold_representative(hold) for hold in holds])
+        merged = False
+        for index in range(1, len(holds) - 1):
+            if holds[index].shape[0] != 1:
+                continue
+            across = (representatives[index - 1] - representatives[index + 1]).abs().mean()
+            left = (representatives[index - 1] - representatives[index]).abs().mean()
+            right = (representatives[index] - representatives[index + 1]).abs().mean()
+            if across * 2 < torch.minimum(left, right):
+                holds[index - 1:index + 2] = [torch.cat((holds[index - 1], holds[index + 1]))]
+                merged = True
+                break
+        if not merged:
+            break
+    return holds
+
+
+def detect_animation_cycle(holds):
     if len(holds) == 1:
-        return 1
+        return 1, 0
     representatives = torch.stack([animation_hold_representative(hold) for hold in holds])
     distances = torch.empty((len(holds), len(holds)), device=representatives.device)
     for index, representative in enumerate(representatives):
         distances[index] = (representatives - representative).abs().mean(dim=1)
     distances = distances.tolist()
 
-    for pose_count in range(2, len(holds) // 2 + 1):
-        matches = True
-        for index in range(pose_count, len(holds)):
-            phase = index % pose_count
-            wrong_distance = min(distances[index][candidate] for candidate in range(pose_count) if candidate != phase)
-            if distances[index][phase] * 2 >= wrong_distance:
-                matches = False
-                break
-        if matches:
-            return pose_count
+    for start in range(len(holds) - 3):
+        remaining = len(holds) - start
+        for pose_count in range(2, remaining // 2 + 1):
+            matches = True
+            for index in range(start + pose_count, len(holds)):
+                phase = start + (index - start) % pose_count
+                wrong_distance = min(
+                    distances[index][candidate]
+                    for candidate in range(start, start + pose_count)
+                    if candidate != phase
+                )
+                if distances[index][phase] * 2 >= wrong_distance:
+                    matches = False
+                    break
+            if matches:
+                return pose_count, start
     raise ValueError(
         f"Could not find a repeated cycle among {len(holds)} held poses. "
         "Set pose_count explicitly, adjust transition_threshold, or provide at least two complete cycles."
     )
+
+
+def detect_animation_pose_count(holds):
+    return detect_animation_cycle(holds)[0]
 
 
 def modal_rgb_composite(frames):
@@ -658,11 +688,12 @@ class PixelArtAnimationPoseCompositor(io.ComfyNode):
     def execute(cls, images, pose_count, transition_threshold, remove_outliers=True):
         if images.shape[-1] < 3:
             raise ValueError(f"Animation pose compositing requires at least 3 image channels, got {images.shape[-1]}")
-        holds = split_animation_holds(images, transition_threshold)
+        holds = merge_interrupted_animation_holds(split_animation_holds(images, transition_threshold))
         if remove_outliers:
             holds = [filter_animation_hold_outliers(hold) for hold in holds]
         if pose_count == 0:
-            pose_count = detect_animation_pose_count(holds)
+            pose_count, cycle_start = detect_animation_cycle(holds)
+            holds = holds[cycle_start:]
         if len(holds) < pose_count:
             raise ValueError(
                 f"Detected {len(holds)} held poses, fewer than pose_count={pose_count}. "
