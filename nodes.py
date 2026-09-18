@@ -105,20 +105,8 @@ def reduce_image_palette(image, color_count):
 
 
 def shared_perceptual_palette(images, color_count):
-    pixels = images[..., :3].reshape(-1, 3)
-    sample_count = min(PALETTE_TRAINING_COLORS, pixels.shape[0])
-    if sample_count < pixels.shape[0]:
-        positions = torch.linspace(0, pixels.shape[0] - 1, sample_count, dtype=torch.float64, device=images.device).round().long()
-        pixels = pixels[positions]
-    rgb8 = (pixels.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
-    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
-    unique_codes, counts = torch.unique(color_codes, return_counts=True)
-    unique_rgb = torch.stack((
-        (unique_codes >> 16) & 255,
-        (unique_codes >> 8) & 255,
-        unique_codes & 255,
-    ), dim=1).to(dtype=images.dtype) / 255.0
-    return perceptual_palette(srgb_to_oklab(unique_rgb), counts, color_count)
+    colors, counts = sampled_image_colors(images)
+    return perceptual_palette(colors, counts, color_count)
 
 
 def palette_from_image(palette_image, additional_color, color_count, dtype, device):
@@ -146,7 +134,8 @@ def palette_from_image(palette_image, additional_color, color_count, dtype, devi
         palette_oklab = perceptual_palette(srgb_to_oklab(training_rgb), training_counts, color_count)
         palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
 
-    palette_rgb = torch.cat((palette_rgb, additional_color.to(device=device, dtype=dtype).reshape(1, 3)))
+    if additional_color is not None:
+        palette_rgb = torch.cat((palette_rgb, additional_color.to(device=device, dtype=dtype).reshape(1, 3)))
     rgb8 = (palette_rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
     unique_codes = torch.unique(color_codes)
@@ -158,7 +147,60 @@ def palette_from_image(palette_image, additional_color, color_count, dtype, devi
     return palette_rgb, srgb_to_oklab(palette_rgb)
 
 
-def reduce_image_batch(images, color_count, shared_palette=False, fixed_palette=None):
+def fixed_palette_from_image(palette_image, background_color, color_count, dtype, device, preserve_background):
+    reference_rgb, reference_oklab = palette_from_image(palette_image, None, color_count, dtype, device)
+    background = (background_color.to(device=device, dtype=dtype).clamp(0.0, 1.0) * 255.0).round() / 255.0 if preserve_background else None
+    if background is None:
+        return reference_rgb, reference_oklab, reference_oklab, None
+    palette_rgb = torch.cat((reference_rgb, background.reshape(1, 3)))
+    rgb8 = (palette_rgb.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
+    unique_codes = torch.unique(color_codes)
+    palette_rgb = torch.stack(((unique_codes >> 16) & 255, (unique_codes >> 8) & 255, unique_codes & 255), dim=1).to(dtype=dtype) / 255.0
+    return palette_rgb, srgb_to_oklab(palette_rgb), reference_oklab, background
+
+
+def sampled_image_colors(images, excluded_color=None):
+    pixels = images[..., :3].reshape(-1, 3)
+    sample_count = min(PALETTE_TRAINING_COLORS, pixels.shape[0])
+    if sample_count < pixels.shape[0]:
+        positions = torch.linspace(0, pixels.shape[0] - 1, sample_count, dtype=torch.float64, device=images.device).round().long()
+        pixels = pixels[positions]
+    rgb8 = (pixels.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+    if excluded_color is not None:
+        excluded8 = (excluded_color.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+        included = torch.any(rgb8 != excluded8, dim=1)
+        if torch.any(included):
+            rgb8 = rgb8[included]
+    color_codes = (rgb8[:, 0] << 16) | (rgb8[:, 1] << 8) | rgb8[:, 2]
+    unique_codes, counts = torch.unique(color_codes, return_counts=True)
+    unique_rgb = torch.stack(((unique_codes >> 16) & 255, (unique_codes >> 8) & 255, unique_codes & 255), dim=1).to(dtype=images.dtype) / 255.0
+    return srgb_to_oklab(unique_rgb), counts
+
+
+def palette_alignment_error(colors, counts, palette, lightness_offset):
+    total = torch.zeros((), dtype=colors.dtype, device=colors.device)
+    weights = counts.to(dtype=colors.dtype)
+    for start in range(0, colors.shape[0], PALETTE_ASSIGNMENT_CHUNK):
+        chunk = colors[start:start + PALETTE_ASSIGNMENT_CHUNK]
+        lightness = chunk[:, None, 0] + lightness_offset - palette[None, :, 0]
+        chroma = chunk[:, None, 1:] - palette[None, :, 1:]
+        distances = lightness.square() + chroma.square().sum(dim=-1)
+        total += (distances.amin(dim=1) * weights[start:start + chunk.shape[0]]).sum()
+    return total / weights.sum()
+
+
+def estimate_palette_lightness_offset(images, palette, excluded_color=None):
+    colors, counts = sampled_image_colors(images, excluded_color)
+    offsets = torch.linspace(-0.2, 0.2, 17, dtype=colors.dtype, device=colors.device)
+    errors = torch.stack([palette_alignment_error(colors, counts, palette, offset) for offset in offsets])
+    best = offsets[errors.argmin()]
+    offsets = torch.linspace(best - 0.025, best + 0.025, 9, dtype=colors.dtype, device=colors.device).clamp(-0.25, 0.25)
+    errors = torch.stack([palette_alignment_error(colors, counts, palette, offset) for offset in offsets])
+    return offsets[errors.argmin()]
+
+
+def reduce_image_batch(images, color_count, shared_palette=False, fixed_palette=None, align_palette_lightness=False):
     if fixed_palette is None and not shared_palette:
         return torch.stack([reduce_image_palette(image, color_count) for image in images])
 
@@ -166,12 +208,31 @@ def reduce_image_batch(images, color_count, shared_palette=False, fixed_palette=
         palette_oklab = shared_perceptual_palette(images, color_count)
         palette_rgb = (oklab_to_srgb(palette_oklab).clamp(0.0, 1.0) * 255.0).round() / 255.0
     else:
-        palette_rgb, palette_oklab = fixed_palette
+        palette_rgb, palette_oklab = fixed_palette[:2]
+
+    lightness_offset = None
+    background = None
+    if fixed_palette is not None and len(fixed_palette) == 4:
+        reference_oklab = fixed_palette[2]
+        background = fixed_palette[3]
+        if align_palette_lightness:
+            lightness_offset = estimate_palette_lightness_offset(images, reference_oklab, background)
 
     output = torch.empty_like(images)
     for index, image in enumerate(images):
         _, inverse, _, unique_oklab = unique_image_colors(image)
-        output[index] = map_unique_colors(image, inverse, unique_oklab, palette_oklab, palette_rgb)
+        matching_oklab = unique_oklab
+        if lightness_offset is not None:
+            matching_oklab = unique_oklab.clone()
+            matching_oklab[:, 0] += lightness_offset
+        mapped = map_unique_colors(image, inverse, matching_oklab, palette_oklab, palette_rgb)
+        if background is not None:
+            rgb8 = (image[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+            background8 = (background.clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
+            mask = torch.all(rgb8 == background8, dim=-1, keepdim=True)
+            mapped_rgb = torch.where(mask, background.reshape(1, 1, 3), mapped[..., :3])
+            mapped = mapped_rgb if mapped.shape[-1] == 3 else torch.cat((mapped_rgb, mapped[..., 3:]), dim=-1)
+        output[index] = mapped
     return output
 
 
@@ -624,6 +685,10 @@ class MiniMaxH3PixelArtRefiner(io.ComfyNode):
                                tooltip="Shift the grid down by this fraction of one logical pixel."),
                 io.Boolean.Input("auto_offset", default=False,
                                  tooltip="Detect the X and Y grid phase separately for each image. Overrides x_offset and y_offset."),
+                io.Boolean.Input("align_palette_lightness", default=True,
+                                 tooltip="Compensate for a shared OKLab lightness shift before matching a supplied palette."),
+                io.Boolean.Input("preserve_generated_background", default=True,
+                                 tooltip="Keep the first input image's upper-left color instead of forcing it into the supplied palette."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use this image's colors as the palette for the entire batch. Palettes above colors are reduced first. Overrides shared_palette."),
             ],
@@ -632,7 +697,8 @@ class MiniMaxH3PixelArtRefiner(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, width, height, colors, color_reduction_first, scale_to_original, allow_uneven_grid=False,
-                shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0, auto_offset=False):
+                shared_palette=False, palette_image=None, x_offset=0.0, y_offset=0.0, auto_offset=False,
+                align_palette_lightness=True, preserve_generated_background=True):
         image_height, image_width = image.shape[1:3]
         if image.shape[-1] < 3:
             raise ValueError(f"MiniMax H3 pixel art refinement requires at least 3 image channels, got {image.shape[-1]}")
@@ -645,17 +711,18 @@ class MiniMaxH3PixelArtRefiner(io.ComfyNode):
 
         fixed_palette = None
         if palette_image is not None:
-            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
+            fixed_palette = fixed_palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device,
+                                                     preserve_generated_background)
         detected_offsets = detect_pixel_grid_offsets(image, width, height) if auto_offset else None
 
         if color_reduction_first:
-            reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
+            reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette, align_palette_lightness)
             return io.NodeOutput(collapse_pixel_grid_mode(reduced, width, height, scale_to_original, allow_uneven_grid,
                                                           x_offset, y_offset, detected_offsets))
 
         collapsed = collapse_pixel_grid_mode(image, width, height, scale_to_original, allow_uneven_grid, x_offset, y_offset,
                                              detected_offsets)
-        return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette))
+        return io.NodeOutput(reduce_image_batch(collapsed, colors, shared_palette, fixed_palette, align_palette_lightness))
 
 
 class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
@@ -680,6 +747,10 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
                                  tooltip="Generate one palette from the entire image batch instead of a separate palette for each frame."),
                 io.Boolean.Input("manual_resolution", default=False,
                                  tooltip="Divide the full frame evenly into width × height cells instead of detecting a mesh."),
+                io.Boolean.Input("align_palette_lightness", default=True,
+                                 tooltip="Compensate for a shared OKLab lightness shift before matching a supplied palette."),
+                io.Boolean.Input("preserve_generated_background", default=True,
+                                 tooltip="Keep the first input image's upper-left color instead of forcing it into the supplied palette."),
                 io.Image.Input("palette_image", optional=True,
                                tooltip="Use this image's colors as the palette for the entire batch. Overrides shared_palette."),
             ],
@@ -688,7 +759,7 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, width, height, colors, scale_to_original, shared_palette=False, palette_image=None,
-                manual_resolution=False):
+                manual_resolution=False, align_palette_lightness=True, preserve_generated_background=True):
         if image.shape[-1] < 3:
             raise ValueError(f"MiniMax H3 pixel art autorefiner requires at least 3 image channels, got {image.shape[-1]}")
         if palette_image is not None and palette_image.shape[-1] < 3:
@@ -698,13 +769,14 @@ class MiniMaxH3PixelArtAutorefiner(io.ComfyNode):
 
         fixed_palette = None
         if palette_image is not None:
-            fixed_palette = palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device)
+            fixed_palette = fixed_palette_from_image(palette_image, image[0, 0, 0, :3], colors, image.dtype, image.device,
+                                                     preserve_generated_background)
         if manual_resolution:
             mesh = regular_mesh(image.shape[2], image.shape[1], width, height)
             mesh_scale = 1
         else:
             mesh, mesh_scale = detect_pixel_mesh(image[0], width, height)
-        reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette)
+        reduced = reduce_image_batch(image, colors, shared_palette, fixed_palette, align_palette_lightness)
         collapsed = [collapse_frame_mesh(frame, mesh, mesh_scale) for frame in reduced]
 
         if scale_to_original:

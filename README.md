@@ -45,13 +45,15 @@ Find **MiniMax H3 Pixel Art Refiner** under `image/minimax`. It includes the ful
 | `x_offset` | 0.0 | Shift the grid right by a fraction of one logical pixel. |
 | `y_offset` | 0.0 | Shift the grid down by a fraction of one logical pixel. |
 | `auto_offset` | Off | Detect X/Y grid phase for every image and override the manual offsets. |
-| `palette_image` | — | Optional image whose RGB colors become the shared palette, reduced to `colors` when needed, plus the first input image's upper-left color. |
+| `align_palette_lightness` | On | Estimate and compensate for a shared OKLab lightness shift before matching a supplied palette. |
+| `preserve_generated_background` | On | Keep the first input image's upper-left RGB color instead of forcing it into the supplied palette. |
+| `palette_image` | — | Optional image whose RGB colors become the shared palette, reduced to `colors` when needed. |
 
 Manual offsets range from `0.0` to `1.0`; for example, `0.5` shifts the grid by half a logical pixel. Offset processing wraps at the outer image edges.
 
 Automatic offset detection finds the strongest repeating X and Y edge phases separately for every image. Flat margins contribute negligible periodic evidence. An axis with no detectable repetition falls back to zero.
 
-When a palette image contains no more than `colors` unique RGB values, those exact colors are retained. Larger palettes are perceptually reduced first. The first input image's upper-left RGB color is then added so a differing background remains available.
+When a palette image contains no more than `colors` unique RGB values, those exact colors are retained. Larger palettes are perceptually reduced first. Lightness alignment finds one OKLab L offset for the complete input batch, applies it only while matching colors, and emits exact RGB values from the supplied palette. Using one offset across the batch avoids per-frame color flicker. When generated-background preservation is enabled, that color is excluded from offset estimation and retained exactly; disabling it restricts the entire output to the supplied palette.
 
 ## MiniMax H3 Pixel Art Autorefiner
 
@@ -74,7 +76,9 @@ The mesh detector is adapted from [Proper Pixel Art](https://github.com/KennethJ
 | `scale_to_original` | On | Fit the collapsed frame inside the original frame and pad it to the original dimensions. |
 | `shared_palette` | On | Generate one palette across the input batch. |
 | `manual_resolution` | Off | Divide the full frame evenly into `width × height` cells instead of detecting a mesh. |
-| `palette_image` | — | Optional image whose colors become the palette for every frame, plus the first input frame's upper-left color. |
+| `align_palette_lightness` | On | Estimate and compensate for a shared OKLab lightness shift before matching a supplied palette. |
+| `preserve_generated_background` | On | Keep the first input frame's upper-left RGB color instead of forcing it into the supplied palette. |
+| `palette_image` | — | Optional image whose colors become the palette for every frame. |
 
 For image batches, the node detects the mesh from the first frame and applies that exact mesh to every later frame. This keeps sprite size and position stable across an animation without combining edge evidence from different frames. With `scale_to_original` disabled, the node returns the detected true pixel resolution.
 
