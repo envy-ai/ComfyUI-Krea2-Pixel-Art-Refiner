@@ -439,6 +439,22 @@ def filter_weak_mesh_lines(lines, edges, pixel_width):
     return lines
 
 
+def merge_half_mesh_cells(lines, pixel_width):
+    lines = list(lines)
+    while len(lines) > 3:
+        gaps = np.diff(lines)
+        merged = False
+        for index, (first, second) in enumerate(zip(gaps, gaps[1:])):
+            combined = first + second
+            if first < pixel_width * 0.8 and second < pixel_width * 0.8 and pixel_width * 0.75 <= combined <= pixel_width * 1.25:
+                del lines[index + 1]
+                merged = True
+                break
+        if not merged:
+            break
+    return lines
+
+
 def filter_short_mesh_cells(lines, edges, pixel_width):
     lines = list(lines)
     radius = max(1, round(pixel_width * 0.2))
@@ -480,8 +496,8 @@ def mesh_from_edges(edges, minimum_pixel_width, maximum_width, maximum_height):
     if len(initial[0]) in (2, 3) and len(initial[1]) in (2, 3):
         return initial
     pixel_width = estimate_mesh_pixel_width(initial, minimum_pixel_width)
-    lines_x = filter_weak_mesh_lines(initial[0], edges, pixel_width)
-    lines_y = filter_weak_mesh_lines(initial[1], edges.T, pixel_width)
+    lines_x = filter_weak_mesh_lines(merge_half_mesh_cells(initial[0], pixel_width), edges, pixel_width)
+    lines_y = filter_weak_mesh_lines(merge_half_mesh_cells(initial[1], pixel_width), edges.T, pixel_width)
     lines_x = filter_short_mesh_cells(lines_x, edges, pixel_width)
     lines_y = filter_short_mesh_cells(lines_y, edges.T, pixel_width)
 
