@@ -236,6 +236,29 @@ def reduce_image_batch(images, color_count, shared_palette=False, fixed_palette=
     return output
 
 
+class PerceptualPaletteReduce(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PerceptualPaletteReduce",
+            display_name="Perceptual Palette Reduce",
+            description="Reduces each image to an automatically selected palette using perceptual OKLab color distance.",
+            category="image/color",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("colors", default=24, min=2, max=256, step=1,
+                             tooltip="Maximum number of colors in each image's palette."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, image, colors):
+        if image.shape[-1] < 3:
+            raise ValueError(f"Perceptual palette reduction requires at least 3 image channels, got {image.shape[-1]}")
+        return io.NodeOutput(torch.stack([reduce_image_palette(batch_image, colors) for batch_image in image]))
+
+
 def select_modal_pixels(pixels, cell_ids, cell_count, center_pixels):
     rgb8 = (pixels[..., :3].clamp(0.0, 1.0) * 255.0).round().to(torch.int64)
     color_codes = (rgb8[..., 0] << 16) | (rgb8[..., 1] << 8) | rgb8[..., 2]

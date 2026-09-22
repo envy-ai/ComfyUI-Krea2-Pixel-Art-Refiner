@@ -1,6 +1,6 @@
 # ComfyUI Pixel Art Refiners
 
-Four ComfyUI nodes that refine generated pixel art and consolidate noisy held animation frames.
+Five ComfyUI nodes that refine generated pixel art and consolidate noisy held animation frames.
 
 The three refiner nodes select perceptual palettes with weighted OKLab clustering and collapse images to a logical pixel grid. Each grid cell uses its most frequent 8-bit RGB color. Ties are resolved by choosing the color perceptually closest to the cell's center pixel in OKLab; any remaining tie uses the first matching pixel in raster order.
 
@@ -12,6 +12,10 @@ git clone https://github.com/envy-ai/ComfyUI-Krea2-Pixel-Art-Refiner.git krea2_p
 ```
 
 Restart ComfyUI after installation.
+
+## Perceptual Palette Reduce
+
+Find **Perceptual Palette Reduce** under `image/color`. It reduces each image in a batch to an automatically selected palette using weighted OKLab clustering. The `colors` input defaults to 24 and accepts values from 2 through 256.
 
 ## Krea 2 Pixel Art Refiner
 
