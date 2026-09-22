@@ -382,6 +382,37 @@ def collapse_pixel_grid_mode(image, logical_width, logical_height, scale_to_orig
     return output
 
 
+class PixelGridCollapse(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="PixelGridCollapse",
+            display_name="Pixel Grid Collapse",
+            description="Collapses each logical pixel to its modal color and expands it back with nearest-neighbor scaling.",
+            category="image/transform",
+            inputs=[
+                io.Image.Input("image"),
+                io.Int.Input("logical_width", default=64, min=1, max=16384, step=1,
+                             tooltip="Number of logical pixels across the result."),
+                io.Int.Input("logical_height", default=64, min=1, max=16384, step=1,
+                             tooltip="Number of logical pixels down the result."),
+            ],
+            outputs=[io.Image.Output()],
+        )
+
+    @classmethod
+    def execute(cls, image, logical_width, logical_height):
+        height, width = image.shape[1:3]
+        if logical_width > width or logical_height > height:
+            raise ValueError(f"Logical grid {logical_width}x{logical_height} cannot exceed image size {width}x{height}")
+        if width % logical_width != 0 or height % logical_height != 0:
+            raise ValueError(f"Image size {width}x{height} must be divisible by logical grid {logical_width}x{logical_height}")
+        if logical_width == width and logical_height == height:
+            return io.NodeOutput(image)
+
+        return io.NodeOutput(collapse_pixel_grid_mode(image, logical_width, logical_height))
+
+
 def frame_edge_map(frame, scale):
     rgb = (frame[..., :3].detach().to(device="cpu").clamp(0.0, 1.0).numpy() * 255.0).round().astype(np.uint8)
     if frame.shape[-1] > 3:
